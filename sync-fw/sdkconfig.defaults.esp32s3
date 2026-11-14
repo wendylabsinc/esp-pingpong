@@ -1,0 +1,4 @@
+# XIAO ESP32S3 Sense: 8 MB octal PSRAM holds the audio ring and fragments.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y

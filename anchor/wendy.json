@@ -1,0 +1,30 @@
+{
+  "appId": "sh.wendy.hackathon.soundsync-anchor",
+  "version": "0.1.0",
+  "platform": "linux",
+  "restartPolicy": "unless-stopped",
+  "env": {
+    "SOUNDSYNC_KEY": "${SOUNDSYNC_KEY}",
+    "ANCHOR_PORT": "usb",
+    "OUT_DIR": "/data/soundsync",
+    "HTTP_PORT": "8091"
+  },
+  "entitlements": [
+    {
+      "type": "network",
+      "mode": "host"
+    },
+    {
+      "type": "http",
+      "port": 8091
+    },
+    {
+      "type": "persist",
+      "name": "soundsync-anchor",
+      "path": "/data"
+    },
+    {
+      "type": "usb"
+    }
+  ]
+}

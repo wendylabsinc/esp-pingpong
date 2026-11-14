@@ -10,6 +10,8 @@ firmware/   board app (C, ESP-IDF, Wendy Lite native app)
 beacon/     beacon-only app for any spare ESP32 (C, plain ESP-IDF)
 box/        WendyOS app (Python, no dependencies): maths, UDP ingest, map page
 tools/      genkey.sh
+sync-fw/    sound-sync firmware for any ESP32: radio timing, mic fragments (C, plain ESP-IDF)
+anchor/     WendyOS app for sync-fw: fragments in through a USB dongle, one timeline (Python)
 ```
 
 ## How it works
@@ -177,3 +179,48 @@ for the sweep detector.
   reads long.
 - Anyone on the network can read the page and change positions. The key
   protects the measurements, not the page.
+
+## Sound sync: triggered audio fragments on one timeline (`sync-fw/`, `anchor/`)
+
+A second, simpler pipeline for long audio. Nodes (XIAO ESP32S3 Sense) record
+32 kHz audio and, when a sound crosses a per-frequency threshold
+(`band 6700 18`: 6.7 kHz, 18 dB over its floor), send 2 s around it to an
+Anchor. The Anchor is a WendyOS device with an ESP32 on USB as its radio
+(`sync-fw` in dongle role; it broadcasts beacons and forwards what it hears).
+Everything travels over ESP-NOW, signed with a shared key (`sync-fw/genkey.sh`).
+
+- **Timestamps.** Every node logs the radio receive time of every beacon it
+  hears, Wi-Fi access point beacons included (promiscuous mode), converted to
+  `esp_timer` on the device (`arrival()`, from `firmware/`). Two nodes that
+  heard the same beacon are related directly, as in `box/`. Access point
+  beacons give that without a third ESP32 wherever an access point is in range.
+- **Fragments.** 2 s at 32 kHz is about 134 KB, sent as about 96 signed pieces
+  of 1.4 KB to the Anchor (unicast, acknowledged, retried). A node keeps up to
+  16 fragments in PSRAM while no Anchor is in range. Measured: about 85 KB/s,
+  no lost pieces over about 20 fragments at a metre.
+- **Anchor** (`anchor/anchor.py`): reassembles, maps samples to node time and
+  node time to the Anchor's and to the other nodes', groups fragments of one
+  sound into an event (one aligned WAV channel per node), serves it all over
+  HTTP. `anchor/clocks.py` reuses `Line` and the densest-band fit from
+  `box/taploc.py`. On WendyOS images without `cdc_acm` it reads the dongle
+  through libusb (`anchor/usbserial.py`).
+- **Ground truth** (`sync-fw/tools/`): `drive <pin> <hz>` on one board and
+  `gpio <pin>` on another put one electrical edge on both clocks.
+  `gpio_truth.py` and `anchor_truth.py` compare those stamps with what the
+  radio mappings predict.
+
+Measured against that wire (XIAO ESP32S3 and ESP32-C5, 2026-11-14):
+
+| Mapping | Edges | Bias | Std | p95 | Worst |
+| --- | --- | --- | --- | --- | --- |
+| Node to node, shared access point beacons, `arrival()` stamps (run 1) | 1201 | -0.33 us | 0.52 us | 1.04 us | 4.9 us |
+| Node to node, same method, C5 on the WendyOS Anchor (run 2) | 1401 | +0.01 us | 0.45 us | 0.60 us | 8.4 us |
+| Node to Anchor time, from the dongle's beacon send times | 1400 | +772 us | 241 us | 1.5 ms | 1.8 ms |
+
+So node-to-node timing is good to about a microsecond with no per-chip
+calibration, and absolute Anchor time to about 2 ms: a sender cannot stamp its
+own transmission, and the queueing and airtime before it are not observable.
+**Not yet measured:** how exactly a recorded sound's samples sit on the node's
+clock (the microphone pipeline's fixed delay and its scatter).
+`sync-fw/tools/audio_truth.py` measures it with contact taps next to the
+microphone; until it has been run, assume only the node-to-node figures above.

@@ -1,0 +1,368 @@
+"""soundsync Anchor: receives node fragments through an ESP32 radio dongle
+(soundsync-fw, beacon role) on USB serial, and places every sample on one
+timeline.
+
+Timeline: the dongle's esp_timer, in microseconds ("anchor time").
+  sample index n -> node esp_timer   block stamps: least-squares slope, lower
+                                     envelope ("now - duration" is late-only)
+  node esp_timer -> anchor time      beacon seq: the node's on-device arrival
+                                     time vs the anchor's esp_timer just before
+                                     it sent that seq; densest band of the
+                                     one-way delays (absolute, tens of us)
+  node -> reference node             reference broadcast: both nodes' arrival
+                                     times of the same beacons (robust line,
+                                     about 1 us); used for relative alignment
+Fragments whose triggers fall within EVENT_GAP of each other form one event:
+events/<t>.json lists every node's trigger on the shared timeline, and
+events/<t>.wav holds one channel per node, aligned.
+
+usage: anchor.py <dongle-port> [out-dir]
+"""
+import base64, hashlib, hmac, json, os, struct, sys, threading, time, collections, wave
+from datetime import datetime, timezone
+import numpy as np
+import serial
+from clocks import Line, band
+
+PORT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ANCHOR_PORT", "/dev/ttyACM0")
+OUT = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUT_DIR", "fragments")
+os.makedirs(OUT, exist_ok=True)
+
+# Shared key (soundsync-fw/genkey.sh). Fail closed: no key, no Anchor.
+_key_text = os.environ.get("SOUNDSYNC_KEY") or open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret.key")).read()
+KEY = bytes.fromhex(_key_text.strip())
+assert len(KEY) == 32, "SOUNDSYNC_KEY must be 64 hex characters"
+TAG_LEN, SSF_HDR = 8, 20
+bad_tags = [0]
+
+def tag_ok(frame):
+    return len(frame) > TAG_LEN and hmac.compare_digest(
+        hmac.new(KEY, frame[:-TAG_LEN], hashlib.sha256).digest()[:TAG_LEN], frame[-TAG_LEN:])
+
+tx_seq = {}                      # beacon seq -> anchor esp_us before send
+tx_lock = threading.Lock()
+host_map = collections.deque(maxlen=200)   # (host_ns_mid, anchor_esp_us, half_rtt_ns)
+pending_ping = {}
+parts = {}                       # (src, frag) -> {idx: bytes}
+
+def mac(b):
+    return b.hex()
+
+def lower_envelope_fit(x, y, bucket):
+    """Fit y = a + b*x through the per-bucket minima of y (late-only noise)."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    k = np.floor((x - x[0]) / bucket)
+    pts = np.array([(x[k == i].mean(), y[k == i].min()) for i in np.unique(k)])
+    if len(pts) >= 2:
+        b, a = np.polyfit(pts[:, 0] - x[0], pts[:, 1], 1)
+    else:
+        b, a = 0.0, pts[0, 1]
+    return lambda q: a + b * (np.asarray(q, float) - x[0]), b
+
+def parse_blob(blob):
+    h = struct.unpack_from("<4s6sHIIqIqIHH", blob, 0)
+    magic, node, nb, frag, rate, first_n, ns, trig_n, hit, nst, nbc = h
+    assert magic == b"SSM1", magic
+    p = struct.calcsize("<4s6sHIIqIqIHH")
+    bands = []
+    for _ in range(nb):
+        bands.append(dict(zip(("hz", "thr_db", "level_db", "floor_db"), struct.unpack_from("<4f", blob, p)))); p += 16
+    stamps = [struct.unpack_from("<qq", blob, p + 16 * i) for i in range(nst)]; p += 16 * nst
+    beacons = []
+    for i in range(nbc):
+        src, soft, seq, rx, arr = struct.unpack_from("<6sHIIq", blob, p); p += 24
+        beacons.append((src.hex(), seq, rx, arr, soft))
+    pcm = np.frombuffer(blob, dtype="<i2", count=ns, offset=p)
+    return dict(node=node.hex(), frag=frag, rate=rate, first_n=first_n, n_samples=ns, trigger_n=trig_n,
+                bands_hit=hit, bands=bands, stamps=stamps, beacons=beacons), pcm
+
+beacon_hist = collections.defaultdict(dict)   # node -> {seq: arrival esp_us}
+ref_node = [None]
+
+def tx_pairs(arrivals):
+    with tx_lock:
+        return [(a, tx_seq[s]) for s, a in arrivals.items() if s in tx_seq]
+
+def place(meta):
+    """sample index -> node esp -> anchor time; plus the node->reference line."""
+    st = np.array(meta["stamps"], float)
+    if len(st) < 5:
+        return None, "too few block stamps"
+    n, esp = st[:, 0], st[:, 1]
+    # The microphone clock is divided from the same crystal as esp_timer
+    # (measured: exactly nominal), so the period is nominal. Fitting it from one
+    # fragment's late-only block stamps adds microseconds of slope error.
+    fitted_us_per_sample, _ = np.polyfit(n, esp, 1)
+    b_us_per_sample = 1e6 / meta["rate"]
+    resid = esp - b_us_per_sample * n
+    a = resid.min()
+    n2esp = lambda q: a + b_us_per_sample * q
+    node = meta["node"]
+    for src, seq, rx, arr, soft in meta["beacons"]:
+        if not soft:
+            beacon_hist[node][seq] = arr
+    if len(beacon_hist[node]) > 6000:
+        for k in sorted(beacon_hist[node])[:2000]:
+            del beacon_hist[node][k]
+    recent = {s: v for s, v in beacon_hist[node].items() if abs(v - n2esp(meta["trigger_n"])) < 30e6}
+    pairs = tx_pairs(recent)
+    if len(pairs) < 10:
+        return None, f"only {len(pairs)} beacons matched to anchor sends"
+    # One-way send times include Wi-Fi queueing and airtime that this cannot
+    # separate from clock offset. Wire test 2026-11-14 (tools/anchor_truth.py):
+    # placed time early by +772 us mean, 241 us std, 1.8 ms worst. So the
+    # error floor is 1 ms: absolute Anchor time is millisecond-grade. Node-to-
+    # node timing uses shared beacons instead (0.45 us std on the same wire).
+    to_anchor = band(pairs, floor_us=1000.0)
+    first, sig = to_anchor(n2esp(meta["first_n"]))
+    trig, _ = to_anchor(n2esp(meta["trigger_n"]))
+    out = dict(first_sample_anchor_us=first, trigger_anchor_us=trig, anchor_sigma_us=sig,
+               trigger_node_esp_us=n2esp(meta["trigger_n"]), first_sample_node_esp_us=n2esp(meta["first_n"]),
+               node_us_per_sample=b_us_per_sample, node_rate_hz_fitted=1e6 / fitted_us_per_sample,
+               node_vs_anchor_ppm=to_anchor.ppm, beacons_matched=len(pairs),
+               stamp_late_p95_us=float(np.percentile(resid - a, 95)))
+    if ref_node[0] is None:
+        ref_node[0] = node
+    out["reference_node"] = ref_node[0]
+    if node != ref_node[0]:
+        ref = beacon_hist[ref_node[0]]
+        common = [(recent[s], ref[s]) for s in recent if s in ref]
+        if len(common) >= 10:
+            rbs = Line(common, 1.0)
+            t_ref, s_ref = rbs(out["trigger_node_esp_us"])
+            out.update(trigger_ref_esp_us=t_ref, ref_sigma_us=s_ref, ref_ppm=rbs.ppm, ref_beacons=len(common))
+    else:
+        out.update(trigger_ref_esp_us=out["trigger_node_esp_us"], ref_sigma_us=0.0, ref_beacons=0)
+    return out, None
+
+def anchor_to_host(t_us):
+    if not host_map:
+        return None
+    best = min(host_map, key=lambda m: m[2])
+    return best[0] + (t_us - best[1]) * 1000  # host monotonic ns (ms-grade)
+
+def write(meta, pcm, placed):
+    d = os.path.join(OUT, meta["node"]); os.makedirs(d, exist_ok=True)
+    stem = os.path.join(d, f"{int(placed['first_sample_anchor_us']) if placed else 0:014d}-f{meta['frag']}")
+    with wave.open(stem + ".wav", "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(meta["rate"]); w.writeframes(pcm.tobytes())
+    host_ns = anchor_to_host(placed["first_sample_anchor_us"]) if placed else None
+    utc = None
+    if host_ns is not None:
+        utc = datetime.fromtimestamp(time.time() - (time.monotonic_ns() - host_ns) / 1e9, timezone.utc).isoformat()
+    j = {k: v for k, v in meta.items() if k not in ("stamps",)}
+    j.update(placed or {}); j["first_sample_utc_approx"] = utc
+    j["timeline"] = "anchor dongle esp_timer, microseconds"
+    with open(stem + ".json", "w") as f:
+        json.dump(j, f, indent=1)
+    return stem
+
+EVENT_GAP_US = 500_000
+events = []   # list of dict(t=anchor us, frags=[(meta, pcm, placed)])
+
+def add_to_event(meta, pcm, placed):
+    t = placed["trigger_anchor_us"]
+    ev = next((e for e in events if abs(e["t"] - t) < EVENT_GAP_US), None)
+    if ev is None:
+        ev = {"t": t, "frags": []}
+        events.append(ev)
+        del events[:-50]
+    ev["frags"] = [f for f in ev["frags"] if f[0]["node"] != meta["node"]] + [(meta, pcm, placed)]
+    write_event(ev)
+
+def write_event(ev):
+    """Shared timeline for an event: the reference node's esp_timer when every
+    fragment has a reference-broadcast line, else anchor time."""
+    frs = ev["frags"]
+    use_ref = all("trigger_ref_esp_us" in p for _, _, p in frs)
+    d = os.path.join(OUT, "events"); os.makedirs(d, exist_ok=True)
+    stem = os.path.join(d, f"{int(ev['t']):014d}")
+    nodes, starts = [], []
+    for meta, pcm, p in frs:
+        if use_ref:
+            shift = p["trigger_ref_esp_us"] - p["trigger_node_esp_us"]
+            start = p["first_sample_node_esp_us"] + shift
+        else:
+            start = p["first_sample_anchor_us"]
+        starts.append(start)
+        nodes.append(dict(node=meta["node"], frag=meta["frag"], bands_hit=meta["bands_hit"],
+                          trigger_us=(p["trigger_ref_esp_us"] if use_ref else p["trigger_anchor_us"]),
+                          sigma_us=(p.get("ref_sigma_us") if use_ref else p["anchor_sigma_us"])))
+    t0 = min(n["trigger_us"] for n in nodes)
+    for n in nodes:
+        n["trigger_minus_first_us"] = n["trigger_us"] - t0
+    rate = frs[0][0]["rate"]
+    begin = max(starts)
+    length = min(st + len(pc) * 1e6 / rate for st, (_, pc, _) in zip(starts, frs)) - begin
+    chans = []
+    for st, (_, pc, _) in zip(starts, frs):
+        k = int(round((begin - st) * rate / 1e6))
+        chans.append(pc[k:k + max(0, int(length * rate / 1e6))])
+    m = min(len(c) for c in chans) if chans else 0
+    if m > 0:
+        inter = np.stack([c[:m] for c in chans], axis=1).astype("<i2")
+        with wave.open(stem + ".wav", "wb") as w:
+            w.setnchannels(len(chans)); w.setsampwidth(2); w.setframerate(rate); w.writeframes(inter.tobytes())
+    with open(stem + ".json", "w") as f:
+        json.dump(dict(timeline="reference node esp_timer" if use_ref else "anchor esp_timer",
+                       reference_node=ref_node[0], aligned_start_us=begin, channels=[n["node"] for n in nodes],
+                       nodes=nodes), f, indent=1)
+    if len(frs) > 1:
+        print(f"event {int(ev['t'])}: {len(frs)} nodes, " + ", ".join(
+            f"{n['node'][-4:]} {n['trigger_minus_first_us']:+.1f} us (±{n['sigma_us']:.1f})" for n in nodes), flush=True)
+
+line_counts = collections.Counter()
+dongle = [None]
+dongle_lock = threading.Lock()
+capture = {"f": None, "until": 0.0, "path": None}
+
+def send_cmd(line):
+    with dongle_lock:
+        dongle[0].write((line.strip() + "\n").encode())
+
+def reader(s):
+    last = time.monotonic()
+    while True:
+        if time.monotonic() - last > 10:
+            last = time.monotonic()
+            pending_pieces = sum(len(v) for v in parts.values())
+            print(f"stats: lines {dict(line_counts)}, bad tags {bad_tags[0]}, pieces waiting {pending_pieces} in {len(parts)} fragments", flush=True)
+        try:
+            raw = s.readline().decode(errors="replace").strip()
+            if capture["f"]:
+                if time.monotonic() > capture["until"]:
+                    capture["f"].close(); capture["f"] = None
+                    print(f"capture done: {capture['path']}", flush=True)
+                elif raw:
+                    capture["f"].write(f"{time.monotonic_ns()},{raw}\n")
+            if raw:
+                line_counts[raw[0] if raw[0] in "TFPAEI" else "?"] += 1
+            if raw.startswith("I,"):
+                print(raw, flush=True)
+            handle(raw)
+        except Exception as e:  # one bad line must not stop the anchor
+            print(f"reader: {e!r}", flush=True)
+
+def handle(line):
+    if True:
+        if not line:
+            return
+        kind = line[0]
+        if kind == "T":
+            _, seq, esp = line.split(",")
+            with tx_lock:
+                tx_seq[int(seq)] = int(esp)
+                if len(tx_seq) > 20000:
+                    for k in sorted(tx_seq)[:5000]:
+                        del tx_seq[k]
+        elif kind == "P":
+            _, tok, esp = line.split(",")
+            t0 = pending_ping.pop(tok, None)
+            if t0:
+                t1 = time.monotonic_ns()
+                host_map.append(((t0 + t1) // 2, int(esp), (t1 - t0) // 2))
+        elif kind == "F":
+            _, src, b64 = line.split(",", 2)
+            try:
+                pkt = base64.b64decode(b64)
+            except Exception:
+                return
+            if not tag_ok(pkt):
+                bad_tags[0] += 1
+                if bad_tags[0] in (1, 10, 100) or bad_tags[0] % 1000 == 0:
+                    print(f"dropped {bad_tags[0]} fragment pieces with bad tags", flush=True)
+                return
+            frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
+            key = (src, boot, frag)
+            parts.setdefault(key, {})[idx] = pkt[SSF_HDR:-TAG_LEN]
+            if len(parts[key]) == count:
+                got = parts.pop(key)
+                blob = b"".join(got[i] for i in range(count))[:blen]
+                try:
+                    meta, pcm = parse_blob(blob)
+                    placed, why = place(meta)
+                    stem = write(meta, pcm, placed)
+                    if placed:
+                        add_to_event(meta, pcm, placed)
+                    peak = int(np.abs(pcm.astype(np.int32)).max()) if len(pcm) else 0
+                    if placed:
+                        print(f"fragment {src} #{frag}: {meta['n_samples']/meta['rate']:.2f} s, bands_hit={meta['bands_hit']:#x}, "
+                              f"first sample at anchor {placed['first_sample_anchor_us']/1e6:.6f} s, node {placed['node_rate_hz_fitted']:.3f} Hz (fit), "
+                              f"{(placed['node_vs_anchor_ppm'] or 0):+.1f} ppm, ±{placed['anchor_sigma_us']:.0f} us, {placed['beacons_matched']} beacons, peak {peak} -> {stem}.wav", flush=True)
+                    else:
+                        print(f"fragment {src} #{frag}: not placed ({why}) -> {stem}.wav", flush=True)
+                except Exception as e:
+                    print(f"fragment {src} #{frag}: parse error {e}", flush=True)
+
+def serve_files():
+    """Browse and download fragments and events: http://<device>:<HTTP_PORT>/"""
+    import functools, http.server
+    port = int(os.environ.get("HTTP_PORT", "0") or 0)
+    if not port:
+        return
+    from urllib.parse import urlparse, parse_qs
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        """Files under OUT, plus:
+        /cmd?line=<dongle command>      e.g. /cmd?line=gpio%206
+        /capture?seconds=<n>            raw dongle lines -> captures/<t>.csv"""
+        def do_GET(self):
+            u = urlparse(self.path); q = parse_qs(u.query)
+            if u.path == "/cmd" and "line" in q:
+                send_cmd(q["line"][0])
+                return self._text(f"sent: {q['line'][0]}\n")
+            if u.path == "/capture":
+                secs = float(q.get("seconds", ["60"])[0])
+                d = os.path.join(OUT, "captures"); os.makedirs(d, exist_ok=True)
+                path = os.path.join(d, f"{int(time.time())}.csv")
+                capture.update(f=open(path, "w"), until=time.monotonic() + secs, path=path)
+                return self._text(f"capturing {secs:.0f} s to /captures/{os.path.basename(path)}\n")
+            return super().do_GET()
+
+        def _text(self, body):
+            b = body.encode()
+            self.send_response(200); self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    handler = functools.partial(Handler, directory=OUT)
+    import socket
+    class DualStack(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            super().server_bind()
+    srv = DualStack(("::", port), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"serving {OUT} on :{port}", flush=True)
+
+def main():
+    serve_files()
+    while True:
+        try:
+            if PORT.startswith("usb"):
+                # "usb" or "usb:<serial>": libusb, for hosts without cdc_acm
+                from usbserial import UsbSerial
+                s = UsbSerial(serial=PORT.split(":", 1)[1] if ":" in PORT else None)
+            else:
+                s = serial.Serial(PORT, 115200, timeout=0.2)
+            dongle[0] = s
+            break
+        except Exception as e:
+            print(f"waiting for dongle on {PORT}: {e}", flush=True)
+            time.sleep(3)
+    for c in ("beacon on", "rate 10", "ap off"):
+        send_cmd(c); time.sleep(0.05)
+    threading.Thread(target=reader, args=(s,), daemon=True).start()
+    print(f"anchor on {PORT}, writing to {OUT}", flush=True)
+    i = 0
+    while True:
+        i += 1
+        tok = str(i)
+        pending_ping[tok] = time.monotonic_ns()
+        send_cmd(f"ping {tok}")
+        if i % 15 == 0:
+            send_cmd("id")
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
