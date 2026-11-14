@@ -294,6 +294,112 @@ def handle(line):
                 except Exception as e:
                     print(f"fragment {src} #{frag}: parse error {e}", flush=True)
 
+def ping_map(host_ns):
+    """Base-station monotonic ns -> dongle esp_timer us, from the tightest
+    recent USB ping round trip (half its width is the bound)."""
+    if not host_map:
+        return None, None
+    best = min(host_map, key=lambda m: m[2])
+    return best[1] + (host_ns - best[0]) / 1000.0, best[2] / 1000.0
+
+def play_chirp(f0, f1, ms, gain):
+    """Play a linear chirp on the base station's speaker and record when its
+    first sample reached the DAC, on the monotonic clock (PortAudio's
+    outputBufferDacTime, mapped by bracketing the stream clock between two
+    monotonic reads) and on the dongle's clock (USB ping map)."""
+    import sounddevice as sd
+    rate = 48000
+    n = int(rate * ms / 1000)
+    t = np.arange(n) / rate
+    chirp = (gain * np.sin(2 * np.pi * (f0 * t + (f1 - f0) / (ms / 1000) * t ** 2 / 2))).astype(np.float32)
+    lead = int(0.2 * rate)                     # 200 ms of silence first
+    buf = np.concatenate([np.zeros(lead, np.float32), chirp, np.zeros(int(0.2 * rate), np.float32)])
+    st = {"pos": 0, "dac": None, "map": None}
+    def cb(out, frames, tinfo, status):
+        pos = st["pos"]
+        chunk = buf[pos:pos + frames]
+        out[:len(chunk), 0] = chunk; out[len(chunk):, 0] = 0
+        if st["dac"] is None and pos <= lead < pos + frames:
+            a = time.monotonic_ns(); s_now = stream.time; b = time.monotonic_ns()
+            st["map"] = ((a + b) / 2) - s_now * 1e9              # monotonic ns - stream s
+            st["dac"] = tinfo.outputBufferDacTime + (lead - pos) / rate
+        st["pos"] = pos + frames
+        if st["pos"] >= len(buf):
+            raise sd.CallbackStop
+    stream = sd.OutputStream(samplerate=rate, channels=1, dtype="float32", callback=cb, latency="low")
+    with stream:
+        while stream.active:
+            time.sleep(0.02)
+    if st["dac"] is None:
+        return {"error": "no DAC time"}
+    mono_ns = st["dac"] * 1e9 + st["map"]
+    esp_us, bound = ping_map(mono_ns)
+    rec = dict(f0=f0, f1=f1, ms=ms, rate=rate, dac_monotonic_ns=mono_ns, dac_dongle_esp_us=esp_us,
+               ping_half_rtt_us=bound, latency_s=stream.latency, wall=time.time())
+    with open(os.path.join(OUT, "chirps.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"chirp played: dac at dongle {esp_us:.0f} us (ping bound {bound:.0f} us), stream latency {stream.latency*1000:.1f} ms", flush=True)
+    return rec
+
+# Stepped chirp on the base station's buzzer: (bytes per half period, cycles).
+# At the bus's ~10.7 KB/s that is ~1.3, 1.8, 2.7 and 5.4 kHz.
+DCHIRP_STEPS = ((4, 80), (3, 100), (2, 150), (1, 300))  # ~230 ms: long enough to hear and record
+
+def prn_levels(n, seed=0xACE1):
+    """16-bit Galois LFSR (taps 0xB400, maximal length): n pseudo-random +-1
+    levels. Deterministic, so the analysis rebuilds the exact sequence played."""
+    s, out = seed & 0xFFFF or 1, []
+    for _ in range(n):
+        lsb = s & 1
+        s >>= 1
+        if lsb:
+            s ^= 0xB400
+        out.append(1 if lsb else -1)
+    return out
+
+PRN_BYTES = 2500   # ~235 ms at ~93.8 us per byte
+
+def dchirp(addr=0x3B, line=7, prn_seed=None):
+    """Play the stepped chirp on the base station's buzzer (TCA9538 at I2C bus 0
+    `addr`, `line`) in ONE I2C write, so the controller clocks every level
+    change at the bus byte rate. Returns the write's monotonic bracket, the byte
+    rate measured by a silent calibration write just before, and the first
+    sound byte's start on the monotonic and dongle clocks."""
+    import tca9538
+    e = tca9538.Expander(0, addr)
+    try:
+        cfg, out = e.read(3), e.read(1)
+        bit = 1 << line
+        hi, lo = (out | bit) & 0xFF, out & ~bit & 0xFF
+        e.write(1, lo); e.write(3, cfg & ~bit)
+        cal = bytes([1]) + bytes([lo]) * 3000                 # silent: level stays low
+        a = time.monotonic_ns(); os.write(e.fd, cal); b = time.monotonic_ns()
+        byte_ns = (b - a) / (len(cal) + 1)                     # + address byte
+        if prn_seed is not None:
+            body = bytes(hi if v > 0 else lo for v in prn_levels(PRN_BYTES, prn_seed))
+        else:
+            body = b"".join((bytes([hi]) * h + bytes([lo]) * h) * c for h, c in DCHIRP_STEPS)
+        msg = bytes([1]) + bytes([lo]) * 20 + body + bytes([lo]) * 20
+        a = time.monotonic_ns(); os.write(e.fd, msg); b = time.monotonic_ns()
+        e.write(1, out); e.write(3, cfg)
+    finally:
+        e.close()
+    # The pin follows each data byte; the first sound byte is byte index
+    # 1 (address) + 1 (register) + 20 (lead) from the start of the transfer.
+    # The transfer ends at ~b, so count back from the end (wake-up slop is
+    # smaller than start latency); also record the front estimate.
+    n_total = len(msg) + 1
+    first_sound_from_end = b - (n_total - 22) * byte_ns
+    first_sound_from_start = a + 22 * byte_ns
+    esp_us, bound = ping_map(first_sound_from_end)
+    rec = dict(addr=addr, line=line, steps=DCHIRP_STEPS, prn_seed=prn_seed, prn_bytes=PRN_BYTES if prn_seed is not None else 0, byte_ns=byte_ns, write_ns=b - a,
+               expected_write_ns=n_total * byte_ns, mono_first_sound_ns=first_sound_from_end,
+               mono_first_sound_front_ns=first_sound_from_start, dongle_esp_us=esp_us,
+               ping_half_rtt_us=bound, wall=time.time())
+    with open(os.path.join(OUT, "dchirps.jsonl"), "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return rec
+
 def serve_files():
     """Browse and download fragments and events: http://<device>:<HTTP_PORT>/"""
     import functools, http.server
@@ -325,6 +431,9 @@ def serve_files():
         def do_GET(self):
             if not self._authorized():
                 return
+            if self.path == "/gpiochips":
+                import gpioline
+                return self._text(json.dumps(gpioline.chips(), indent=1) + "\n")
             return super().do_GET()
 
         def do_HEAD(self):
@@ -342,6 +451,47 @@ def serve_files():
                     return self.send_error(400, "command not allowed")
                 send_cmd(line)
                 return self._text(f"sent: {line}\n")
+            if u.path == "/buzz":
+                # Toggling an arbitrary GPIO line can disturb the board (one
+                # expander line on the Dragonwing is not free); off by default.
+                if os.environ.get("ALLOW_GPIO_BUZZ") != "1":
+                    return self.send_error(403, "set ALLOW_GPIO_BUZZ=1 to enable /buzz")
+                import gpioline
+                chip = q.get("chip", ["/dev/gpiochip4"])[0]
+                if not chip.startswith("/dev/gpiochip") or not chip[13:].isdigit():
+                    return self.send_error(400, "bad chip")
+                try:
+                    line = int(q["line"][0]); hz = min(max(float(q.get("hz", ["2000"])[0]), 50.0), 8000.0)
+                    ms = min(max(float(q.get("ms", ["300"])[0]), 1.0), 2000.0)
+                    ln = gpioline.Line(chip, line)
+                    try:
+                        edges = gpioline.square(ln, hz, ms)
+                    finally:
+                        ln.close()
+                except (KeyError, ValueError, OSError) as e:
+                    return self.send_error(400, f"buzz failed: {e}")
+                gaps = np.diff(np.array(edges, float)) / 1e3 if len(edges) > 1 else np.array([0.0])
+                want = 1e6 / hz / 2
+                rec = dict(chip=chip, line=line, hz=hz, ms=ms, edges=len(edges), first_edge_monotonic_ns=edges[0] if edges else None,
+                           half_period_us=want, gap_err_us_p50=float(np.median(np.abs(gaps - want))),
+                           gap_err_us_max=float(np.abs(gaps - want).max()))
+                return self._text(json.dumps(rec) + "\n")
+            if u.path == "/dchirp":
+                try:
+                    seed = q.get("prn", [None])[0]
+                    rec = dchirp(prn_seed=int(seed, 0) if seed else None)
+                except (OSError, ValueError) as ex:
+                    return self.send_error(400, f"dchirp failed: {ex}")
+                return self._text(json.dumps(rec) + "\n")
+            if u.path == "/chirp":
+                try:
+                    f0 = float(q.get("f0", ["2000"])[0]); f1 = float(q.get("f1", ["6000"])[0])
+                    ms = min(max(float(q.get("ms", ["10"])[0]), 1.0), 100.0)
+                    gain = min(max(float(q.get("gain", ["0.5"])[0]), 0.0), 1.0)
+                except ValueError:
+                    return self.send_error(400, "bad chirp parameters")
+                rec = play_chirp(f0, f1, ms, gain)
+                return self._text(json.dumps(rec) + "\n")
             if u.path == "/capture":
                 try:
                     secs = min(max(float(q.get("seconds", ["60"])[0]), 1.0), 3600.0)
@@ -394,9 +544,9 @@ def main():
         tok = str(i)
         pending_ping[tok] = time.monotonic_ns()
         send_cmd(f"ping {tok}")
-        if i % 15 == 0:
+        if i % 75 == 0:
             send_cmd("id")
-        time.sleep(1)
+        time.sleep(0.2)
 
 if __name__ == "__main__":
     main()

@@ -25,6 +25,16 @@
     },
     {
       "type": "usb"
+    },
+    {
+      "type": "audio"
+    },
+    {
+      "type": "gpio"
+    },
+    {
+      "type": "i2c",
+      "device": "i2c-0"
     }
   ]
 }
