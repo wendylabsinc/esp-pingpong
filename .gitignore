@@ -18,3 +18,7 @@ sync-fw/sdkconfig.old
 sync-fw/managed_components/
 anchor/secret.key
 anchor/fragments/
+range/build/
+range/sdkconfig
+range/sdkconfig.old
+range/managed_components/

@@ -12,6 +12,7 @@ box/        WendyOS app (Python, no dependencies): maths, UDP ingest, map page
 tools/      genkey.sh
 sync-fw/    sound-sync firmware for any ESP32: radio timing, mic fragments (C, plain ESP-IDF)
 anchor/     WendyOS app for sync-fw: fragments in through a USB dongle, one timeline (Python)
+range/      two boards measure the distance between them and print it, no box (C, Wendy Lite native app)
 ```
 
 ## How it works
