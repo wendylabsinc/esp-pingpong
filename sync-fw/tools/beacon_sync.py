@@ -9,9 +9,17 @@ reference-broadcast time sync. It needs no wire and no sound.
 Accepts serial captures of either firmware:
   sync-fw:      ...,E,<src>,<seq>,<rx>,<esp>,<rssi>,<arrival_us>,<soft>
   Wendy Lite:   ... wendy_espnow: B,<seq>,<arrival_us>,<rssi>   (ESP_LOG text or JSON chunks)
-usage: beacon_sync.py <capture A> <capture B> [window_s=20]"""
+With --ap the reference is the Wi-Fi access point's own beacons instead (any
+two receivers on the channel share those; a beacon is identified by the AP
+and the timestamp it carries):
+  sync-fw:      ...,A,<bssid>,<ap_tsf>,<rx>,<esp>,<rssi>,<channel>,<arrival_us>,<soft>
+  Wendy Lite:   ... wendy_espnow: A,<bssid>,<ap_tsf>,<arrival_us>
+usage: beacon_sync.py [--ap] <capture A> <capture B> [window_s=20]"""
 import json, re, sys
 import numpy as np
+
+AP = "--ap" in sys.argv
+sys.argv = [a for a in sys.argv if a != "--ap"]
 
 def load(path):
     text = open(path, errors="replace").read()
@@ -24,6 +32,13 @@ def load(path):
                 pass
         text = "".join(buf)
     out = {}
+    if AP:
+        for m in re.finditer(r"\bA,([0-9a-f]{12}),(\d+),\d+,-?\d+,-?\d+,\d+,(-?\d+),([01])", text):
+            if m.group(4) == "0":
+                out[(m.group(1), int(m.group(2)))] = int(m.group(3))
+        for m in re.finditer(r"\bA,([0-9a-f]{12}),(\d+),(-?\d+)(?![,\d])", text):
+            out[(m.group(1), int(m.group(2)))] = int(m.group(3))
+        return out
     for m in re.finditer(r"\bE,[0-9a-f]{12},(\d+),\d+,-?\d+,-?\d+,(-?\d+),([01])", text):
         if m.group(3) == "0":
             out[int(m.group(1))] = int(m.group(2))
@@ -33,6 +48,13 @@ def load(path):
 
 a, b = load(sys.argv[1]), load(sys.argv[2])
 window = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
+if AP:   # keep the access point both heard most
+    shared = [k for k in a if k in b]
+    if shared:
+        best = max(set(k[0] for k in shared), key=lambda bs: sum(1 for k in shared if k[0] == bs))
+        a = {k: v for k, v in a.items() if k[0] == best}
+        b = {k: v for k, v in b.items() if k[0] == best}
+        print(f"access point {best}")
 seqs = sorted(set(a) & set(b))
 print(f"beacons: A {len(a)}, B {len(b)}, heard by both {len(seqs)}")
 if len(seqs) < 30:

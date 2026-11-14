@@ -86,5 +86,21 @@ So there are two variants here:
   port 43024.
 - Beacons alongside it: the node stamped 1,951 beacons in 200 s (the dongle
   sends 10 per second) while the mesh link was up.
-- **Not yet measured:** time sync between two nodes on this firmware (needs a
-  second node), to compare with the 1 us baseline above.
+- **Time sync on this firmware, node against the dongle** (both on a laptop,
+  so without the mesh link; reference: the venue access point's beacons, which
+  both stamp; `beacon_sync.py --ap`, 20 s windows, about 1,100 beacons each):
+
+  | Node firmware | Std | p95 | Worst |
+  | --- | --- | --- | --- |
+  | sync-fw (before) | 0.76 us | 1.38 us | 2.99 us |
+  | Wendy Lite leaf + wendy_espnow, first version | 1.32 us | 2.81 us | 5.76 us |
+  | same, clocks read with interrupts off | 0.85 us | 1.66 us | 3.96 us |
+
+  Wendy Lite also runs Bluetooth and the mesh; an interrupt between reading
+  the radio clock and esp_timer went into the stamp. Reading both inside a
+  critical section brought it back into the old firmware's range (two XIAOs on
+  sync-fw in run r7: 0.76 to 1.03 us). The gap between the two esp_timer reads
+  is now 2 us on average, 6 us at most.
+- **Not yet measured:** the same comparison while the mesh link is up.
+- Seen once and not reproduced: the node went silent on its USB console about
+  a second after opening a stream with no relay answering, until reset.

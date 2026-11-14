@@ -24,4 +24,13 @@ menu "Wendy ESP-NOW link"
         bool "Log every beacon's receive time (B lines)"
         depends on WENDY_ESPNOW
         default y
+
+    config WENDY_ESPNOW_LOG_AP_BEACONS
+        bool "Also log the receive time of the associated AP's beacons (A lines)"
+        depends on WENDY_ESPNOW
+        default n
+        help
+            For measuring time sync against any other receiver on the channel,
+            without a second node. Turns promiscuous receive of management
+            frames on.
 endmenu

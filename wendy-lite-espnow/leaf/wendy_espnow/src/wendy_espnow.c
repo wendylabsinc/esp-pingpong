@@ -104,20 +104,32 @@ static bool tag_ok(const uint8_t *frame, size_t len)
 /* When the frame just handed to us arrived, on esp_timer: the radio stamped it
  * on its own clock; read that clock between two esp_timer reads and subtract
  * the frame's age (as in esp-pingpong firmware/main/main.c arrival()). */
+static portMUX_TYPE s_stamp_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_gap_max, s_gap_sum, s_gap_count;
+
 static int64_t arrival(uint32_t rx_ts, bool *soft)
 {
     int64_t now = 0, gap = INT64_MAX;
     uint32_t radio_now = 0;
-    for (int i = 0; i < 3 && gap > 20; i++) {
+    /* The two clocks are read back to back with interrupts off: this firmware
+     * also runs Bluetooth and the mesh, and an interrupt between the reads
+     * would go straight into the stamp. */
+    for (int i = 0; i < 4 && gap > 6; i++) {
+        portENTER_CRITICAL(&s_stamp_lock);
         int64_t before = esp_timer_get_time();
         uint32_t radio = esp_wifi_internal_get_mac_clock_time();
         int64_t after = esp_timer_get_time();
+        portEXIT_CRITICAL(&s_stamp_lock);
         if (after - before < gap) {
             gap = after - before;
             now = before + gap / 2;
             radio_now = radio;
         }
     }
+    if ((uint32_t)gap > s_gap_max)
+        s_gap_max = (uint32_t)gap;
+    s_gap_sum += (uint32_t)gap;
+    s_gap_count++;
     uint32_t late = radio_now - rx_ts;
     *soft = late >= RX_STAMP_MAX_LATE_US;
     return *soft ? now : now - (int64_t)late;
@@ -156,6 +168,49 @@ static void on_beacon(const esp_now_recv_info_t *info, const uint8_t *data, int 
     ESP_LOGI(TAG, "B,%lu,%lld,%d", (unsigned long)seq, (long long)at, info->rx_ctrl->rssi);
 #endif
 }
+
+#if CONFIG_WENDY_ESPNOW_LOG_AP_BEACONS
+/* The access point this node is associated with also broadcasts beacons, each
+ * carrying the AP's own timestamp (TSF). Stamping them the same way gives a
+ * reference any other receiver on the channel shares: the check that the
+ * receive stamps of this firmware are as good as sync-fw's. */
+static uint8_t s_bssid[6];
+static volatile bool s_ap_log;
+
+static void promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (type != WIFI_PKT_MGMT || !s_ap_log)
+        return;
+    const wifi_promiscuous_pkt_t *p = buf;
+    const uint8_t *f = p->payload;
+    if (p->rx_ctrl.sig_len < 36 || f[0] != 0x80 || memcmp(f + 16, s_bssid, 6))
+        return; /* beacons of our own AP only */
+    bool soft;
+    int64_t at = arrival(p->rx_ctrl.timestamp, &soft);
+    if (soft)
+        return;
+    uint64_t tsf = 0;
+    for (int i = 7; i >= 0; i--)
+        tsf = (tsf << 8) | f[24 + i];
+    ESP_LOGI(TAG, "A,%02x%02x%02x%02x%02x%02x,%llu,%lld", f[16], f[17], f[18], f[19], f[20], f[21],
+             (unsigned long long)tsf, (long long)at);
+}
+
+static void ap_log_poll(void)
+{
+    wifi_ap_record_t ap;
+    if (s_ap_log || esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+        return;
+    memcpy(s_bssid, ap.bssid, 6);
+    wifi_promiscuous_filter_t filter = {.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(promisc_cb);
+    if (esp_wifi_set_promiscuous(true) == ESP_OK) {
+        s_ap_log = true;
+        ESP_LOGI(TAG, "stamping beacons of AP " MACSTR " on channel %u", MAC2STR(s_bssid), ap.primary);
+    }
+}
+#endif
 
 static void on_downlink(const uint8_t *data, int len, int64_t now)
 {
@@ -290,6 +345,9 @@ static void link_task(void *arg)
                 wake_owner();
             }
         }
+#if CONFIG_WENDY_ESPNOW_LOG_AP_BEACONS
+        ap_log_poll();
+#endif
         if (now - last_report > 10000000) {
             last_report = now;
             uint8_t channel = 0;
@@ -297,12 +355,14 @@ static void link_task(void *arg)
             esp_wifi_get_channel(&channel, &second);
             xSemaphoreTake(s_lock, portMAX_DELAY);
             ESP_LOGI(TAG, "ch=%u anchor=%d beacons=%lu bad_tags=%lu replays=%lu stream=%s conn=%08lx tx_segments=%lu "
-                          "rx_segments=%lu retx=%lu send_failures=%lu opened=%lu",
+                          "rx_segments=%lu retx=%lu send_failures=%lu opened=%lu stamp_gap_us=%lu/%lu",
                      channel, anchor_fresh(), (unsigned long)s_log_count, (unsigned long)s_bad_tags,
                      (unsigned long)s_replays, s_open ? (ens_closed(&s_ens) ? "closed" : "open") : "none",
                      (unsigned long)s_ens.conn, (unsigned long)s_ens.stat_tx_segments,
                      (unsigned long)s_ens.stat_rx_segments, (unsigned long)s_ens.stat_retx,
-                     (unsigned long)s_send_failures, (unsigned long)s_opened);
+                     (unsigned long)s_send_failures, (unsigned long)s_opened,
+                     (unsigned long)(s_gap_count ? s_gap_sum / s_gap_count : 0), (unsigned long)s_gap_max);
+            s_gap_max = s_gap_sum = s_gap_count = 0;
             xSemaphoreGive(s_lock);
         }
     }
