@@ -72,5 +72,19 @@ So there are two variants here:
 - Time sync before this change, from run r12 (three nodes, old firmware,
   `sync-fw/tools/beacon_sync.py`): two nodes agree on the beacons both heard to
   0.94 to 1.01 us std, 1.9 to 2.2 us p95, 4.9 to 5.9 us worst, in 20 s windows.
-- **Not yet run on a node.** Whether the node's handshake with the agent
-  completes over this stream is untested, as is time sync alongside it.
+- **On hardware (2026-11-14, node 4ff8 on `leaf/`, Dragonwing "iq9"):** the
+  node opened the ESP-NOW stream and logged `mesh peer f0d76aed-... authenticated`
+  1.7 s later; the Dragonwing's `wendy device wendy-net topology` lists the node
+  (`.../device/dfecff41-...`, transport `leaf`) as its one authenticated peer.
+  After the leaf's 125 s boot barrier, 8 of 8 TCP connections from the
+  Dragonwing to the node's mesh address (`fd45:b891:567f:4e80:91ee:1923:bc51:6d4b`,
+  port 5054) succeeded in 93 to 453 ms while the stream counters rose. Over the
+  first 4.5 minutes the stream carried 77 KB up and 255 KB down on one
+  connection, with 3 retransmissions on the node and 19 on the Anchor.
+  The node's log names the carrier "Wi-Fi TCP" because the leaf dialled the
+  local proxy; the venue Wi-Fi does not let anything reach the Dragonwing's
+  port 43024.
+- Beacons alongside it: the node stamped 1,951 beacons in 200 s (the dongle
+  sends 10 per second) while the mesh link was up.
+- **Not yet measured:** time sync between two nodes on this firmware (needs a
+  second node), to compare with the 1 us baseline above.
