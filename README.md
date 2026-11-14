@@ -7,6 +7,7 @@ every number.
 
 ```
 firmware/   board app (C, ESP-IDF, Wendy Lite native app)
+beacon/     beacon-only app for any spare ESP32 (C, plain ESP-IDF)
 box/        WendyOS app (Python, no dependencies): maths, UDP ingest, map page
 tools/      genkey.sh
 ```
@@ -31,7 +32,10 @@ tools/      genkey.sh
   its own transmission, but most beacons leave after nearly the same wait, so
   the crowd of typical ones in each direction pins the offset. That takes
   about a minute of beacons to settle, and on real boards two independent
-  halves of a 75 s recording agreed to about 20 us. The box uses whichever of
+  halves of a 75 s recording agreed to about 20 us. With a third sender (a
+  spare ESP32-C5 running `beacon/`), the same two boards' 206 shared beacons
+  over 63 s lay within 1.5 us of one straight line, and the two-way estimate
+  was 8 us from it. The box uses whichever of
   sweeps, beacons and calibration taps is tightest at the moment of each tap.
   Beacons give no distance.
 - **No Wi-Fi needed.** By default each board leaves its Wi-Fi network and
@@ -115,6 +119,11 @@ used. "Hears none of our own sweeps" means the buzzer is not making sound.
 Without hardware, `cd box && TAPLOC_KEY=$(printf '00%.0s' $(seq 32)) TAPLOC_CONFIG=./config.json python3 server.py`
 and `python3 test_taploc.py localhost` in a second terminal streams a simulated
 array to the page.
+
+A spare ESP32 of any kind makes a third sender for two boards: it needs no
+microphone. `cd beacon && idf.py set-target <chip> && idf.py -p <port> flash`.
+It uses the same key and must be on the boards' channel (`CHANNEL` at the top
+of `beacon/main/beacon.c`).
 
 Self-checks: `python3 box/test_taploc.py` for the box maths, and
 `clang -O2 -o /tmp/test_chirp firmware/test_chirp.c -lm && /tmp/test_chirp`

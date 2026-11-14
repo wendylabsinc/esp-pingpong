@@ -8,3 +8,6 @@ firmware/managed_components/
 __pycache__/
 box/config.json
 firmware/.cache
+beacon/build/
+beacon/sdkconfig
+beacon/sdkconfig.old
