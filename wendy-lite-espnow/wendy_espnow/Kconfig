@@ -1,0 +1,21 @@
+menu "Wendy ESP-NOW link"
+    config WENDY_ESPNOW
+        bool "ESP-NOW link: time-sync beacons and a Wendy Net carrier stream"
+        default n
+        depends on WENDY_WIFI_ENABLED
+        help
+            Listens for signed soundsync beacons (SSB1) from an Anchor dongle
+            and logs their hardware receive time on the esp_timer clock, the
+            reference-broadcast time sync of the acoustic nodes. Beacons stay
+            plain ESP-NOW broadcasts so their receive stamps are untouched.
+
+            Also offers Wendy Net a carrier: a reliable byte stream to the
+            Anchor over ESP-NOW unicast frames. Wendy Net runs its usual
+            mutually authenticated TLS over that stream, so the Anchor's
+            dongle and relay only carry ciphertext. Hackathon feature.
+
+    config WENDY_ESPNOW_LOG_BEACONS
+        bool "Log every beacon's receive time (B lines)"
+        depends on WENDY_ESPNOW
+        default y
+endmenu

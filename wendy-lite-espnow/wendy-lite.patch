@@ -1,0 +1,140 @@
+diff --git a/components/wendy_net_peer/CMakeLists.txt b/components/wendy_net_peer/CMakeLists.txt
+index 62c45ed..5c1196c 100644
+--- a/components/wendy_net_peer/CMakeLists.txt
++++ b/components/wendy_net_peer/CMakeLists.txt
+@@ -6,7 +6,7 @@ else()
+ endif()
+ idf_component_register(SRCS ${native_driver_sources} "src/operator.c" "src/operator_worker.c" "src/router.c" "src/control.c" "src/router_session.c" "src/topology_record.c" "src/crypto_job.c" "src/certificate_worker.c" "src/certificate_read.c" "src/catalog_node.c" "src/manifest_catalog.c" "src/catalog_guest.c" "src/service_store.c"  "src/protocol.c" "src/binary.c" "src/packet.c" "src/directory.c" "src/manifest_service.c" "src/service_protocol.c" "src/guest_json.c" "src/certificate_fetch.c" "src/certificate_store.c" "src/certificate_wire.c"
+     INCLUDE_DIRS "include" PRIV_INCLUDE_DIRS "src"
+-    REQUIRES wendy_ble wendy_wifi mdns esp_netif esp_wifi vfs nvs_flash wendy_net_common wendy_pki wendy_conf wendy_com wendy_net_gossip wendy_babel esp_timer esp_hw_support lwip freertos pthread espressif__cjson)
++    REQUIRES wendy_espnow wendy_ble wendy_wifi mdns esp_netif esp_wifi vfs nvs_flash wendy_net_common wendy_pki wendy_conf wendy_com wendy_net_gossip wendy_babel esp_timer esp_hw_support lwip freertos pthread espressif__cjson)
+ 
+ if(CONFIG_WENDY_NET_PEER AND NOT CMAKE_BUILD_EARLY_EXPANSION)
+  target_compile_definitions(${COMPONENT_LIB} PUBLIC WNA_IO_BYTES=${CONFIG_WENDY_NET_IO_BYTES})
+diff --git a/components/wendy_net_peer/src/peer.c b/components/wendy_net_peer/src/peer.c
+index 162fdb1..6360d2e 100644
+--- a/components/wendy_net_peer/src/peer.c
++++ b/components/wendy_net_peer/src/peer.c
+@@ -54,6 +54,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#if CONFIG_WENDY_ESPNOW
++#include "wendy_espnow.h"
++#endif
+ 
+ #ifndef CONFIG_WENDY_NET_PACKET_QUEUE
+ #define CONFIG_WENDY_NET_PACKET_QUEUE 4
+@@ -168,6 +171,9 @@ struct peer_state {
+     QueueHandle_t ble_reports;
+     wendy_net_memory_reservation_t ble_reports_charge;
+     struct wble_mesh_pipe *ble_pipe;
++#if CONFIG_WENDY_ESPNOW
++    bool espnow; /* this link's TLS runs over the ESP-NOW stream to the Anchor */
++#endif
+     uint8_t ble_advertisement[WN_BLE_ADVERTISEMENT_SIZE];
+     bool ble_initialized, ble_published;
+ #endif
+@@ -1285,6 +1291,12 @@ static void close_session(struct peer_state *s, int candidate)
+         wble_mesh_release(s->ble_pipe);
+         s->ble_pipe = NULL;
+     }
++#endif
++#if CONFIG_WENDY_ESPNOW
++    if (s->espnow) {
++        wendy_espnow_release();
++        s->espnow = false;
++    }
+ #endif
+     struct peer_state *root = node_root(s);
+     memset(&s->assembler, 0, sizeof s->assembler);
+@@ -2574,6 +2586,33 @@ static void router_run(struct peer_state *root)
+                 begin_setup(link, &hint, -1);
+             }
+         }
++#endif
++#if CONFIG_WENDY_ESPNOW
++        /* ESP-NOW carrier: when the Anchor's dongle is in range, dial it over
++         * the reliable ESP-NOW stream. The Anchor relays the bytes to its
++         * WendyOS agent's LAN TLS listener, so this is an ordinary client
++         * carrier setup whose transport is a stream instead of a socket. */
++        if (!accepted && root->clock_ready && setup_capacity_available(root) && setup_room(root) &&
++            medium_available(root, WN_LAN)) {
++            struct wendy_pki_stream stream;
++            if (wendy_espnow_take(&stream)) {
++                accepted = true;
++                struct peer_state *link = reserve_slot(root);
++                if (!link)
++                    wendy_espnow_release();
++                else {
++                    hint = (struct wn_candidate){.medium = WN_LAN, .port = 43024, .cost = WNR_LAN_COST};
++                    strcpy(hint.address, "espnow");
++                    wendy_espnow_set_wake(wnad_wake);
++                    link->espnow = true;
++                    link->setup_stream = stream;
++                    link->setup_have_stream = true;
++                    link->setup_server = false;
++                    begin_setup(link, &hint, -1);
++                    ESP_LOGI(TAG, "dialing the Anchor over ESP-NOW");
++                }
++            }
++        }
+ #endif
+         if (!accepted && lan && root->listener >= 0 && root->clock_ready &&
+             setup_capacity_available(root) && setup_room(root) && medium_available(root, WN_LAN)) {
+@@ -2645,6 +2684,10 @@ static void router_run(struct peer_state *root)
+              * Preserve the reply until the host accepts that retained SDU. */
+             if (link->ble_pipe && !wble_mesh_output_drained(link->ble_pipe))
+                 output_drained = false;
++#endif
++#if CONFIG_WENDY_ESPNOW
++            if (link->espnow && !wendy_espnow_output_drained())
++                output_drained = false;
+ #endif
+         }
+         wn_settings_poll(output_drained);
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 33b74b4..c7a3d5c 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -6,5 +6,5 @@ idf_component_register(
+     SRCS ${main_sources}
+     INCLUDE_DIRS "."
+     REQUIRES wendy_core
+-    PRIV_REQUIRES wendy_pki wendy_net_peer wendy_sensor_link wendy_benchmark wendy_display esp_driver_tsens
++    PRIV_REQUIRES wendy_pki wendy_net_peer wendy_sensor_link wendy_benchmark wendy_clock_echo wendy_espnow wendy_display esp_driver_tsens
+ )
+diff --git a/main/wendy_main.c b/main/wendy_main.c
+index 91f8bf0..1518094 100644
+--- a/main/wendy_main.c
++++ b/main/wendy_main.c
+@@ -20,6 +20,12 @@
+ #if CONFIG_WENDY_KORVO_BENCHMARK
+ #include "wendy_benchmark.h"
+ #endif
++#if CONFIG_WENDY_CLOCK_ECHO
++#include "wendy_clock_echo.h"
++#endif
++#if CONFIG_WENDY_ESPNOW
++#include "wendy_espnow.h"
++#endif
+ 
+ void app_main(void)
+ {
+@@ -54,6 +60,16 @@ void app_main(void)
+ #if CONFIG_WENDY_NET_PEER
+     ESP_ERROR_CHECK(wendy_net_peer_start());
+ #endif
++#if CONFIG_WENDY_ESPNOW
++    if (wendy_espnow_start() != ESP_OK) {
++        ESP_LOGW("main", "ESP-NOW link could not start");
++    }
++#endif
++#if CONFIG_WENDY_CLOCK_ECHO
++    if (wendy_clock_echo_start() != ESP_OK) {
++        ESP_LOGW("main", "clock echo responder could not start");
++    }
++#endif
+ #if CONFIG_WENDY_DISPLAY_ESP32S31_KORVO_1
+     esp_err_t display_err = wendy_display_start();
+     if (display_err != ESP_OK) {

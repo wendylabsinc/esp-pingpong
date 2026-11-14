@@ -18,6 +18,7 @@ events/<t>.wav holds one channel per node, aligned.
 
 usage: anchor.py <dongle-port> [out-dir]
 """
+import enstream
 import base64, hashlib, hmac, json, os, struct, sys, threading, time, collections, wave
 from datetime import datetime, timezone
 import numpy as np
@@ -344,6 +345,13 @@ def handle(line):
                     print(f"dropped {bad_tags[0]} fragment pieces with bad tags", flush=True)
                 return
             frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
+            if frag & 0xC0000000 == 0x40000000:  # Wendy Net carrier stream segment
+                if stream_relay[0]:
+                    seg = enstream.parse_uplink(pkt)
+                    if seg[4] & enstream.ACKONLY:
+                        seg = seg[:5] + (b"",)
+                    stream_relay[0].uplink(src, seg)
+                return
             if frag & 0x80000000:  # node log frame, not audio
                 node_log(src, boot, frag & 0x7FFFFFFF, pkt[SSF_HDR:-TAG_LEN][:blen])
                 return
@@ -357,6 +365,7 @@ def handle(line):
             if len(parts[key]) == count:
                 finish(key)
 
+stream_relay = [None]              # enstream.Relay once the dongle is open
 nodelog_last = {}                  # node -> (boot, last sequence)
 nodelog_gaps = collections.Counter()
 
@@ -594,7 +603,8 @@ def serve_files():
                 return self._text(json.dumps({
                     "lines": dict(line_counts), "bad_tags": bad_tags[0], "b64_errors": b64_errors[0],
                     "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed), "salvaged": dict(salvaged), "lost": dict(lost_fragments),
-                    "malformed_lines": dict(malformed), "usb_lines_lost": usb_lines_lost[0], "nacks": dict(nacks), "nodelog_gaps": dict(nodelog_gaps), "unknown_lines": line_counts.get("?", 0),
+                    "malformed_lines": dict(malformed), "usb_lines_lost": usb_lines_lost[0], "nacks": dict(nacks), "nodelog_gaps": dict(nodelog_gaps),
+                    "streams": stream_relay[0].snapshot() if stream_relay[0] else None, "unknown_lines": line_counts.get("?", 0),
                     "incomplete": inc, "dongle_info": last_info[0],
                     "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": usb.backlog() if hasattr(usb, "backlog") else None,
                 }, indent=1) + "\n")
@@ -697,6 +707,10 @@ def main():
             else:
                 s = serial.Serial(PORT, 115200, timeout=0.2)
             dongle[0] = s
+            if stream_relay[0] is None:
+                host, _, port = os.environ.get("STREAM_TARGET", "127.0.0.1:43024").rpartition(":")
+                stream_relay[0] = enstream.Relay(send_cmd, (host, int(port)),
+                                                 log=lambda m: print(m, flush=True))
             break
         except Exception as e:
             print(f"waiting for dongle on {PORT}: {e}", flush=True)
