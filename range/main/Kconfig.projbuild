@@ -1,0 +1,89 @@
+menu "Ping-pong range"
+
+    config PP_BUZZER_GPIO
+        int "GPIO the piezo buzzer is on"
+        default 1
+        range 0 48
+        help
+            GPIO 1 is pad D0 on the XIAO ESP32S3. The piezo goes between this
+            pin and GND.
+
+    config PP_SELF_MM
+        int "Distance from the buzzer to the microphone on a board (mm)"
+        default 40
+        range 0 500
+        help
+            Each board hears its own sweep a few centimetres away, and the
+            result is corrected for it. An error here adds straight onto
+            every distance. Measure it, and keep it the same on both boards.
+
+    config PP_TEMP_C10
+        int "Air temperature in tenths of a degree C"
+        default 200
+        range -200 500
+        help
+            Speed of sound is 331.3 + 0.606 * T m/s: 0.17% per degree.
+
+    config PP_SWEEP_F0
+        int "Sweep start (Hz)"
+        default 2000
+
+    config PP_SWEEP_F1
+        int "Sweep end (Hz)"
+        default 6000
+
+    config PP_SWEEP_MS
+        int "Sweep length (ms)"
+        default 64
+        range 20 64
+
+    config PP_DETECT_DB
+        int "A sweep must stand this far above the background (dB)"
+        default 10
+        range 8 30
+
+    config PP_ROUND_MS
+        int "Time between ping-pong rounds (ms)"
+        default 1500
+        range 800 60000
+
+    config PP_REPLY_MS
+        int "How long the replying board waits before its sweep (ms)"
+        default 500
+        range 400 2000
+        help
+            The detector is deaf for about a third of a second after a sweep,
+            so this must stay above 400. A shorter wait leaves less time for
+            the two clocks to drift apart between the sweeps.
+
+    config PP_CHANNEL
+        int "ESP-NOW channel (both boards must match)"
+        default 1
+        range 1 13
+        help
+            The boards leave their Wi-Fi network and sit on this channel.
+
+    config PP_GROUP
+        int "Group id: boards only talk to boards with the same id"
+        default 1
+        range 0 255
+
+    config PP_BUZZER_GPIO2
+        int "Second buzzer GPIO for bridge drive (-1: none)"
+        default 2
+        range -1 48
+        help
+            With a pin here the buzzer is driven from both pins in opposite
+            phase, which doubles the voltage across a piezo: about 6 dB louder.
+            GPIO 2 is pad D1 on the XIAO ESP32S3. Wire the piezo between D0
+            and D1, NOT to GND. Set -1 to go back to D0 and GND.
+
+    config PP_SELFTEST_S
+        int "Buzzer test at boot: seconds of sweeps before ranging starts (0: off)"
+        default 30
+        range 0 120
+        help
+            The board plays back-to-back sweeps so the buzzer can be heard and
+            its wires checked. Ranging starts when it ends.
+
+endmenu
