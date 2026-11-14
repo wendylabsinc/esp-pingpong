@@ -244,15 +244,17 @@ A recorded sound's time, measured with a sound whose emission time is known:
   slips by whole cycles.
 - **Node to node.** Two XIAOs record the same code; node B's clock is mapped
   onto node A's through the beacons both heard (`two_node_truth.py`). Two runs:
-  10 of 10 codes with 10.2 us std (worst 22.5 us), then 9 of 10 with about
-  8.5 us std plus one outlier at +132 us, likely a one-chip correlation slip.
-  The constant between runs (-53 us, then -41 us) is the nodes' different
-  distance to the buzzer.
+  10 of 10 codes with 10.2 us std (worst 22.5 us), then 9 of 10 with 8.5 us
+  std plus one outlier at +92 us (132 us away from the others), possibly a
+  one-chip correlation slip. The median (-53 us, then -41 us) is consistent
+  with the nodes' different distances to the buzzer; the distances were not
+  measured.
 
-Known limit: when two nodes send fragments at the same time, pieces are lost
-between the dongle and the Anchor (base64 over the ESP32's built-in USB serial
-console; the Anchor kept 32 half-assembled fragments). The tests above
-staggered the nodes' sends. Binary framing, a larger blocking USB buffer and
+Known limit: after two nodes sent fragments at the same time, the Anchor was
+left with 32 incomplete fragments (2,599 pieces waiting), while the dongle's
+radio queue reported no drops. The likely cause is the base64 stream over the
+ESP32's built-in USB serial console falling behind. The tests above staggered
+the nodes' sends. Binary framing, a larger blocking USB buffer and
 acknowledgements from the dongle are the fix.
 
 The WendyOS agent's `gpio` entitlement mounts only `/dev/gpiochip0`-`7`; the
