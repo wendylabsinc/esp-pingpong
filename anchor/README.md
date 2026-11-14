@@ -21,8 +21,11 @@ the USB link and the dongle's last `I` line, for diagnosing delivery loss.
 
 The ESP-IDF USB-Serial-JTAG console gives up on output after a short timeout
 when the host is not reading, so `usbserial.py` drains the endpoint on its own
-thread and parsing runs separately. Pieces are still lost after this change
-(unexplained as of 2026-11-14; `/stats` counts where). Each line keeps the time of the USB
+thread and parsing runs separately. Pieces still went missing after this change, but not on USB: with numbered
+lines the dongle's receive count, its forwarded count and the lines parsed here
+matched exactly, so the loss is between the dongle radio's acknowledgement and
+its receive callback (inferred from those counters). The Anchor asks the node
+for the missing pieces (`nack`). Each line keeps the time of the USB
 read that delivered it, so the USB ping map is not widened by parsing delays.
 
 Output: `<OUT_DIR>/<node>/<anchor_us>-f<n>.wav|json` per fragment and

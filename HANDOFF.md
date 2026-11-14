@@ -62,6 +62,37 @@ holds the component sources and the patches to apply. Local copies: worktree
    the sender address; needs nodes and dongle reflashed together), and a local
    WendyOS fix for the gpio entitlement (`fix/gpio-entitlement-all-chips`).
 
+## Security limits found in review (not fixed)
+
+A read-only review of the radio-facing code found no memory-safety bug in
+`ens.c` or the node component, no way for an untagged frame to reach the
+stream code, and no way to make the relay connect anywhere but its configured
+target. It did find these, all rooted in one shared key with no freshness:
+
+1. **Replay without the key.** The tag covers neither a nonce nor the sender
+   address. A recorded stream "hello" frame, replayed, makes the Anchor close
+   that node's live relay connection and open a new one
+   (`anchor/enstream.py`, "superseded"). The node's TLS session then has to
+   start over. Binding the sender into the tag (`sender-bound-tags`) and a
+   per-connection nonce would close this.
+2. **Downlink segments are not checked for sender or freshness** on the node
+   (`on_downlink`); a replayed segment of the live connection can stall it
+   until the next probe.
+3. **No global cap on relay connections.** One per sender address, each with a
+   socket to the agent and up to 96 KB of buffers; a key holder (or the replay
+   above with spoofed addresses) can exhaust sockets. The connect also runs on
+   the USB reader thread.
+4. **No rate limit on resets** sent for unknown connections: each costs a
+   dongle command and a radio frame.
+5. **A fragment's piece count is trusted from the frame.** A tagged frame with
+   a count of 65,535 makes the Anchor scan that range twice a second and build
+   a 92 MB zero-filled fragment after 20 s.
+6. **Node log frames can grow disk use without bound** (one file per sender
+   address).
+
+Items 3 to 6 need the shared key. TLS between node and agent is unaffected by
+all six: they cost availability, not confidentiality.
+
 ## Gotchas
 
 **Reaching the Dragonwing**

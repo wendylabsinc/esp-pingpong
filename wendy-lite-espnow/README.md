@@ -26,7 +26,8 @@ time-sync beacons, which stay plain ESP-NOW broadcasts.
 - `anchor/enstream.py` is the Anchor side: the same stream, relayed to the
   WendyOS agent's Wendy Net TLS listener on `127.0.0.1:43024`. TLS runs between
   the node and the agent, so the dongle and the Anchor only carry ciphertext.
-- The dongle firmware is unchanged: it already forwards SSF1 frames to USB and
+- The dongle firmware needed no further change (its `nack` command was added
+  earlier in this branch for resend requests): it already forwards SSF1 frames to USB and
   sends SSN1 frames on its `nack` command; the stream rides those two paths.
   The downlink therefore carries at most 120 bytes per frame.
 
