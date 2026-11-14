@@ -28,6 +28,7 @@
  * its own interrupt), so a single wire to another device's "gpio" pin gives
  * both a shared physical edge: the ground truth for sync accuracy.
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,7 @@
 #include "esp_private/wifi.h" /* esp_wifi_internal_get_mac_clock_time */
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 #include "psa/crypto.h"
@@ -138,7 +140,40 @@ typedef struct {
     uint8_t data[SSF_HDR + SSF_CHUNK + TAG_LEN];
 } fwd_t;
 static QueueHandle_t s_fwd;
-static volatile uint32_t s_fwd_drops;
+static volatile uint32_t s_fwd_drops, s_fwd_rx, s_fwd_out, s_out_drops, s_nacks_sent;
+
+/* All lines the Anchor parses go out through one lock and the USB driver
+ * directly, blocking up to 1 s for room instead of letting the console drop
+ * characters when the host is slow. A line that still cannot be written is
+ * counted (out_drops in the I line), never silently cut. */
+static SemaphoreHandle_t s_out_lock;
+
+static void emit(const char *buf, size_t len)
+{
+    xSemaphoreTake(s_out_lock, portMAX_DELAY);
+    while (len) {
+        int n = usb_serial_jtag_write_bytes(buf, len, pdMS_TO_TICKS(1000));
+        if (n <= 0) {
+            s_out_drops++;
+            break;
+        }
+        buf += n;
+        len -= n;
+    }
+    xSemaphoreGive(s_out_lock);
+}
+
+static void emitf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        emit(buf, n < (int)sizeof buf ? (size_t)n : sizeof buf - 1);
+    }
+}
 
 #define SSB_MAGIC "SSB1"
 
@@ -232,9 +267,17 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
         memcpy(f.data, data, len);
         if (xQueueSend(s_fwd, &f, 0) != pdTRUE) {
             s_fwd_drops++;
+        } else {
+            s_fwd_rx++;
         }
         return;
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (len >= SSN_HDR + TAG_LEN && memcmp(data, SSN_MAGIC, 4) == 0) {
+        nack_received(info->src_addr, data, len);
+        return;
+    }
+#endif
     if (len != SSB_LEN || memcmp(data, SSB_MAGIC, 4) != 0) {
         return;
     }
@@ -271,7 +314,7 @@ static void forward_task(void *arg)
 {
     (void)arg;
     static fwd_t f;
-    static unsigned char b64[2 * (SSF_HDR + SSF_CHUNK + TAG_LEN) + 8];
+    static unsigned char b64[2 * (SSF_HDR + SSF_CHUNK + TAG_LEN) + 24];
     char mac[13];
     for (;;) {
         if (xQueueReceive(s_fwd, &f, portMAX_DELAY) != pdTRUE) {
@@ -281,7 +324,30 @@ static void forward_task(void *arg)
         mbedtls_base64_encode(b64, sizeof b64, &olen, f.data, f.len);
         b64[olen] = 0;
         sprintf(mac, "%02x%02x%02x%02x%02x%02x", f.src[0], f.src[1], f.src[2], f.src[3], f.src[4], f.src[5]);
-        printf("F,%s,%s\n", mac, b64);
+        /* F,<src>,<b64>,<n>: n counts forwarded lines, so the Anchor sees any
+         * line lost between here and its parser as a gap. */
+        uint32_t n = ++s_fwd_out;
+        int k = (int)olen;
+        k += snprintf((char *)b64 + k, sizeof b64 - k, ",%lu\n", (unsigned long)n);
+        char head[16];
+        int h = snprintf(head, sizeof head, "F,%s,", mac);
+        xSemaphoreTake(s_out_lock, portMAX_DELAY);
+        const char *parts[2] = {head, (const char *)b64};
+        size_t lens[2] = {(size_t)h, (size_t)k};
+        for (int i = 0; i < 2; i++) {
+            const char *b = parts[i];
+            size_t left = lens[i];
+            while (left) {
+                int w = usb_serial_jtag_write_bytes(b, left, pdMS_TO_TICKS(1000));
+                if (w <= 0) {
+                    s_out_drops++;
+                    break;
+                }
+                b += w;
+                left -= w;
+            }
+        }
+        xSemaphoreGive(s_out_lock);
     }
 }
 
@@ -369,19 +435,19 @@ static void print_task(void *arg)
         switch (e.kind) {
         case EV_AP:
             hex6(mac, e.mac);
-            printf("A,%s,%llu,%lu,%lld,%d,%u,%lld,%u\n", mac, (unsigned long long)e.a, (unsigned long)e.rx,
+            emitf("A,%s,%llu,%lu,%lld,%d,%u,%lld,%u\n", mac, (unsigned long long)e.a, (unsigned long)e.rx,
                    (long long)e.esp_us, e.rssi, e.channel, (long long)e.arrival, e.soft);
             break;
         case EV_ESPNOW:
             hex6(mac, e.mac);
-            printf("E,%s,%llu,%lu,%lld,%d,%lld,%u\n", mac, (unsigned long long)e.a, (unsigned long)e.rx,
+            emitf("E,%s,%llu,%lu,%lld,%d,%lld,%u\n", mac, (unsigned long long)e.a, (unsigned long)e.rx,
                    (long long)e.esp_us, e.rssi, (long long)e.arrival, e.soft);
             break;
         case EV_TX:
-            printf("T,%llu,%lld\n", (unsigned long long)e.a, (long long)e.esp_us);
+            emitf("T,%llu,%lld\n", (unsigned long long)e.a, (long long)e.esp_us);
             break;
         case EV_GPIO:
-            printf("G,%u,%u,%lld\n", e.pin, e.level, (long long)e.esp_us);
+            emitf("G,%u,%u,%lld\n", e.pin, e.level, (long long)e.esp_us);
             break;
         }
     }
@@ -401,16 +467,65 @@ static void print_id(void)
     hex6(mac, m);
     uint32_t ver = 0;
     esp_now_get_version(&ver);
-    printf("I,%s,ch=%u,beacon=%d,rate=%d,ap=%d,drops=%lu,fwd_drops=%lu,espnow_v=%lu,anchor=%d,boot=%08lx,bad_tags=%lu,replays=%lu\n",
-           mac, s_channel, s_beacon_on, s_rate_hz, s_ap_log, (unsigned long)s_drops, (unsigned long)s_fwd_drops,
-           (unsigned long)ver, g_have_anchor, (unsigned long)g_boot_id, (unsigned long)s_bad_tags,
-           (unsigned long)s_replays);
+    emitf("I,%s,ch=%u,beacon=%d,rate=%d,ap=%d,drops=%lu,fwd_drops=%lu,espnow_v=%lu,anchor=%d,boot=%08lx,bad_tags=%lu,"
+          "replays=%lu,fwd_rx=%lu,fwd_out=%lu,out_drops=%lu,nacks=%lu\n",
+          mac, s_channel, s_beacon_on, s_rate_hz, s_ap_log, (unsigned long)s_drops, (unsigned long)s_fwd_drops,
+          (unsigned long)ver, g_have_anchor, (unsigned long)g_boot_id, (unsigned long)s_bad_tags,
+          (unsigned long)s_replays, (unsigned long)s_fwd_rx, (unsigned long)s_fwd_out, (unsigned long)s_out_drops,
+          (unsigned long)s_nacks_sent);
+}
+
+/* "nack <node mac hex> <node boot hex> <frag> <i,i,...>": ask a node to resend
+ * the listed pieces of one fragment (SSN1, unicast, signed). The node's boot
+ * id makes a request from before its last restart harmless. */
+static void send_nack(const char *args)
+{
+    char mac_hex[13] = {0}, list[400] = {0};
+    unsigned long boot = 0, frag = 0;
+    if (sscanf(args, "%12s %lx %lu %399s", mac_hex, &boot, &frag, list) != 4) {
+        return;
+    }
+    uint8_t dst[6];
+    for (int i = 0; i < 6; i++) {
+        unsigned v;
+        if (sscanf(mac_hex + 2 * i, "%2x", &v) != 1) {
+            return;
+        }
+        dst[i] = (uint8_t)v;
+    }
+    uint8_t msg[SSN_HDR + 2 * SSN_MAX + TAG_LEN];
+    uint16_t n = 0;
+    for (char *tok = strtok(list, ","); tok && n < SSN_MAX; tok = strtok(NULL, ",")) {
+        uint16_t idx = (uint16_t)atoi(tok);
+        memcpy(msg + SSN_HDR + 2 * n, &idx, 2);
+        n++;
+    }
+    if (!n) {
+        return;
+    }
+    uint32_t b = boot, fr = frag;
+    memcpy(msg, SSN_MAGIC, 4);
+    memcpy(msg + 4, &b, 4);
+    memcpy(msg + 8, &fr, 4);
+    memcpy(msg + 12, &n, 2);
+    size_t len = SSN_HDR + 2 * n;
+    if (!make_tag(msg, len, msg + len)) {
+        return;
+    }
+    if (!esp_now_is_peer_exist(dst)) {
+        esp_now_peer_info_t peer = {.channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false};
+        memcpy(peer.peer_addr, dst, 6);
+        esp_now_add_peer(&peer);
+    }
+    if (esp_now_send(dst, msg, len + TAG_LEN) == ESP_OK) {
+        s_nacks_sent++;
+    }
 }
 
 static void cmd_task(void *arg)
 {
     (void)arg;
-    char line[64];
+    char line[512];
     for (;;) {
         if (!fgets(line, sizeof line, stdin)) {
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -427,8 +542,15 @@ static void cmd_task(void *arg)
             set_channel((uint8_t)atoi(line + 3));
         } else if (!strcmp(line, "ap on")) {
             s_ap_log = true;
+            esp_wifi_set_promiscuous(true);
         } else if (!strcmp(line, "ap off")) {
+            /* also stop promiscuous receive: in a busy venue every management
+             * frame would otherwise take a receive buffer from ESP-NOW */
             s_ap_log = false;
+            esp_wifi_set_promiscuous(false);
+        } else if (!strncmp(line, "nack ", 5)) {
+            send_nack(line + 5);
+            continue;
         } else if (!strcmp(line, "gpiotrig on")) {
             g_gpio_trigger = 1;
         } else if (!strcmp(line, "gpiotrig off")) {
@@ -455,7 +577,7 @@ static void cmd_task(void *arg)
             continue;
 #endif
         } else if (!strncmp(line, "ping ", 5)) {
-            printf("P,%s,%lld\n", line + 5, (long long)esp_timer_get_time());
+            emitf("P,%s,%lld\n", line + 5, (long long)esp_timer_get_time());
             continue;
         }
         print_id();
@@ -468,7 +590,10 @@ void app_main(void)
     s_q = xQueueCreate(256, sizeof(ev_t));
     s_fwd = xQueueCreate(24, sizeof(fwd_t));
 
+    s_out_lock = xSemaphoreCreateMutex();
     usb_serial_jtag_driver_config_t ucfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    ucfg.tx_buffer_size = 16384; /* about 8 forwarded pieces of slack */
+    ucfg.rx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&ucfg);
     usb_serial_jtag_vfs_use_driver();
     setvbuf(stdin, NULL, _IONBF, 0);

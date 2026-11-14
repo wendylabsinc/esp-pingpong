@@ -11,6 +11,10 @@
  * SSF1 fragment chunk: "SSF1", u32 frag_id, u16 idx, u16 count, u32 blob_len,
  *   u32 boot id, then up to SSF_CHUNK data bytes of the fragment blob, tag.
  *
+ * SSN1 resend request (Anchor -> node, through the dongle): "SSN1", u32 node
+ *   boot id, u32 frag_id, u16 n, n x u16 piece index, tag. A node answers only
+ *   for its current boot id, from fragments it still holds.
+ *
  * Fragment blob = meta, then PCM (int16 mono at meta.rate):
  *   "SSM1", u8 node_mac[6], u16 n_bands, u32 frag_id, u32 rate,
  *   i64 first_n, u32 n_samples, i64 trigger_n, u32 bands_hit,
@@ -30,6 +34,9 @@
 #define TAG_LEN 8
 #define SSB_LEN (20 + TAG_LEN)
 #define MAX_BANDS 8
+#define SSN_MAGIC "SSN1"
+#define SSN_HDR 14
+#define SSN_MAX 64
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -80,3 +87,4 @@ extern uint32_t g_boot_id;
 /* audio.c (targets with the XIAO PDM microphone) */
 void audio_start(void);
 int audio_command(const char *line); /* returns 1 if handled */
+void nack_received(const uint8_t *src, const uint8_t *data, int len); /* Wi-Fi task */

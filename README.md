@@ -185,7 +185,7 @@ for the sweep detector.
 
 A second, simpler pipeline for long audio. Nodes (XIAO ESP32S3 Sense) record
 32 kHz audio and, when a sound crosses a per-frequency threshold
-(`band 6700 18`: 6.7 kHz, 18 dB over its floor), send 2 s around it to an
+(`band 6700 18`: 6.7 kHz, 18 dB over its floor), send 1 s around it (`pre`, `post`) to an
 Anchor. The Anchor is a WendyOS device with an ESP32 on USB as its radio
 (`sync-fw` in dongle role; it broadcasts beacons and forwards what it hears).
 Everything travels over ESP-NOW, signed with a shared key (`sync-fw/genkey.sh`).
@@ -195,7 +195,7 @@ Everything travels over ESP-NOW, signed with a shared key (`sync-fw/genkey.sh`).
   `esp_timer` on the device (`arrival()`, from `firmware/`). Two nodes that
   heard the same beacon are related directly, as in `box/`. Access point
   beacons give that without a third ESP32 wherever an access point is in range.
-- **Fragments.** 2 s at 32 kHz is about 134 KB, sent as about 96 signed pieces
+- **Fragments.** 2 s at 32 kHz (the earlier default) is about 134 KB, sent as about 96 signed pieces
   of 1.4 KB to the Anchor (unicast, acknowledged, retried). A node keeps up to
   16 fragments in PSRAM while no Anchor is in range. Measured: about 85 KB/s,
   no lost pieces over about 20 fragments at a metre.
@@ -257,6 +257,114 @@ radio queue reported no drops. The likely cause is the base64 stream over the
 ESP32's built-in USB serial console falling behind. The tests above staggered
 the nodes' sends. Binary framing, a larger blocking USB buffer and
 acknowledgements from the dongle are the fix.
+
+### Three nodes (2026-11-14)
+
+Three XIAOs about 5 cm from the Dragonwing's buzzer, 10 codes
+(`sync-fw/tools/run_three.sh`). Node-to-node difference per code, B - A:
+
+| Pair | Codes in both | Median | Std | Worst from median |
+| --- | --- | --- | --- | --- |
+| 4824, 4e58 | 4 | -161 us | 67 us | 150 us |
+| 4e58, 4ff8 | 4 | +48 us | 13 us | 21 us |
+| 4824, 4ff8 | 4 | -113 us | 62 us | 141 us |
+
+The medians include the nodes' different distances to the buzzer (not
+measured). For each code all three nodes caught, the three pairwise
+differences sum to within 0.1 us of zero. Each node's code location enters all
+of its pairs, so this shows the beacon fits agree with each other, not that
+the code was located correctly in the audio. Both larger scatters come from one
+code that node 4824 located about 150 us off at low correlation quality. Four
+codes per pair is a small sample.
+
+Delivery was the open problem: only 4 of 10 codes reached the Anchor from both
+nodes of a pair. Changes, then a second run (r4, below):
+
+- **Room noise.** At +12 dB, nodes kept triggering on room noise and filled
+  the radio link; a 16 s level sample showed room peaks of about +8 dB at
+  1.8 kHz. The code reached +25 dB at 2.7 kHz on both nodes sampled but only +5
+  to +10 dB at 1.8 kHz. Fragments from the third node, recorded with both bands
+  at +12 dB, show which band fired: every code fragment on 2.7 kHz; room
+  fragments on 1.8 kHz 21 times and on 2.7 kHz 11 times. At +18 dB one node
+  caught only 1 of 4 codes. The firmware default is now 2.7 kHz only at +15 dB,
+  with 1 s fragments (`pre 300`, `post 700`), half the airtime of 2 s ones.
+- **Send slots.** Each node waits `slot x 1.8 s` (slot from its MAC address,
+  `slot <n>` overrides) before its first send of a fragment, so nodes that heard
+  the same sound do not all send at once.
+- **Failed pieces are resent.** The node firmware skipped a piece that failed
+  all 4 send attempts and still reported the fragment delivered. It now resends
+  only the failed pieces, in up to 4 rounds (`R,<frag>,round=..,resent=..,
+  still=..` on serial), and keeps the fragment queued until every piece is
+  acknowledged. In r4 no node needed a resend, so this path is untested in the
+  field.
+- **Pieces still lost after the dongle acknowledged them.** In r4 every piece
+  from every node was acknowledged on the first try (serial `S` lines), yet 2
+  of 88 fragments reached the Anchor with holes (5 and 8 pieces). `GET /stats`
+  counted 3 malformed base64 lines since the Anchor started; one line that
+  loses its newline on the USB link swallows the next, so a few malformed
+  lines can account for several pieces. The Anchor drains USB on its own
+  thread (longest gap between reads 14 ms). The fix belongs in the dongle:
+  binary framing, blocking USB writes, and acknowledgements from the Anchor.
+
+#### Run r4: 20 codes after the changes
+
+All three nodes on the new firmware, Anchor reached through Wendy Cloud, run
+inside the Anchor container (`sync-fw/tools/run_on_anchor.py`). Codes caught:
+18, 19 and 15 of 20. While codes played, each code's fragments arrived before
+the next code (10 s apart). Node-to-node difference via shared beacons, the
+path the Anchor's events use:
+
+| Pair | Codes in both | Median | Std | Worst from median | Max - min |
+| --- | --- | --- | --- | --- | --- |
+| 4824, 4e58 | 18 | -512 us | 46 us | 167 us | 249 us |
+| 4824, 4ff8 | 14 | -128 us | 97 us | 335 us | 376 us |
+| 4e58, 4ff8 | 15 | +395 us | 125 us | 381 us | 404 us |
+
+The nodes were rearranged between runs (cables moved), so the medians differ
+from the first run. Within r4 the earliest 1 or 2 codes are off in every pair, and the
+last 2 only in the two pairs with node 4ff8, by the same amount in both (about
+130 to 160 us, about 5 cm of sound path), consistent with nodes being moved
+during the run. Leaving those out, each pair spans 45 to 57 us (std 13 to
+17 us, 11 to 16 codes). Including them, every difference stays within 405 us
+of every other for the same pair, under the 1 ms target for the error between
+nodes' detections of one sound.
+
+#### Run r7: resend requests (dongle, node and Anchor changes)
+
+- **Dongle:** every forwarded line carries a running number (`F,<src>,<b64>,<n>`),
+  output goes through one lock straight to the USB driver and blocks up to 1 s
+  instead of dropping, the I line reports `fwd_rx`, `fwd_out`, `out_drops` and
+  `nacks`, Wi-Fi receive buffers went from 10 static and 32 dynamic to 16 and 64,
+  and `ap off` also turns promiscuous receive off.
+- **Nodes:** keep their last 6 delivered fragments and answer a signed SSN1
+  request ("resend pieces i, j of fragment f", current boot id only).
+- **Anchor:** asks for the missing pieces of a fragment that has been silent for
+  1.5 s (up to 3 requests, `nack` command through the dongle), salvages after
+  20 s, and counts gaps in the dongle's line numbers.
+
+r7, 20 codes, all four boards on this firmware: every fragment completed (none
+salvaged or lost). The Anchor sent 18 requests and 8 fragments completed
+because of them. The dongle received 4,134 pieces, forwarded 4,134 lines, and
+the Anchor parsed 4,134 with no numbering gaps or damaged lines, so no piece
+was lost on USB; the pieces that went missing were acknowledged by the dongle's
+radio but never reached its receive callback. The dongle's boot id stayed the
+same through the run.
+
+| Pair | Codes in both | Std | Worst from median |
+| --- | --- | --- | --- |
+| 4e58, 4ff8 | 17 | 10 us | 21 us |
+| 4824, 4e58 | 19 | 71 us | 311 us |
+| 4824, 4ff8 | 17 | 74 us | 310 us |
+
+The 95th percentile spread in node 4824's pairs is 53 to 77 us; the worst value
+is one code. Absolute base station to node time came out 1.5 to 2 ms off on
+average with 6 of 19 codes over 5 ms, so that path is unreliable here; it is not
+the node-to-node timing above.
+
+The Anchor-clock path (each node placed by the dongle's beacon send times) did
+worse here than in the first run: std 185 to 385 us, worst 1.4 ms from the
+median. Absolute time, base station to node, came out 1.5 to 2 ms early on
+average, against -82 us in the earlier end-to-end test. Not investigated.
 
 The WendyOS agent's `gpio` entitlement mounts only `/dev/gpiochip0`-`7`; the
 Dragonwing's ninth chip carries pin 33, so the Anchor drives that expander over

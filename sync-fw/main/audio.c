@@ -3,6 +3,7 @@
  * fragments sent to the Anchor over ESP-NOW.
  */
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,8 @@
 #include "driver/i2s_pdm.h"
 #include "rom/ets_sys.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_timer.h"
@@ -19,6 +22,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "proto.h"
+
+static void nlogf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #define RATE 32000
 #define BLOCK 640                       /* 20 ms */
@@ -54,10 +59,18 @@ static band_t s_bands[MAX_BANDS];
 static int s_nbands;
 static int s_mode_all;           /* 0: any band, 1: all bands */
 static int s_need_blocks = 3;    /* consecutive blocks over threshold */
-static int s_pre_ms = 500, s_post_ms = 1500;
+static int s_pre_ms = 300, s_post_ms = 700;  /* 1 s fragments: half the airtime of 2 s */
+static int s_send_slot;              /* 0..3, from the MAC; "slot <n>" overrides */
+#define SLOT_MS 400                  /* stagger of fresh fragments between nodes; resend requests repair collisions */
 static volatile int s_force;
 static volatile int s_enabled = 1;
 static volatile int s_print_levels;
+/* "trace on": every 5 blocks (100 ms) print what the trigger saw, to explain a
+ * missed sound afterwards:
+ *   V,<first sample>,<max dB over floor x10>,<max consecutive blocks over>,
+ *     <fire bits, one per block, oldest first>,<onset bits>,<fragments recording>,
+ *     <floor dB x10 of band 0> */
+static volatile int s_trace;
 static uint32_t s_frag_id;
 static SemaphoreHandle_t s_sent;
 typedef struct { int64_t first, trig; uint32_t ns, hit, id; } job_t;
@@ -137,6 +150,45 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     return len;
 }
 
+/* One piece, acknowledged by the receiver's radio (ESP-NOW unicast), with up
+ * to 4 attempts. A confirmation left over from an earlier timed-out attempt is
+ * cleared first, so it cannot be mistaken for this piece's. */
+static int send_piece(const uint8_t *dst, const uint8_t *blob, size_t len, uint32_t frag_id, uint16_t i, uint16_t count)
+{
+    uint8_t pkt[SSF_HDR + SSF_CHUNK + TAG_LEN];
+    size_t off = (size_t)i * SSF_CHUNK, n = len - off < SSF_CHUNK ? len - off : SSF_CHUNK;
+    memcpy(pkt, "SSF1", 4);
+    memcpy(pkt + 4, &frag_id, 4);
+    memcpy(pkt + 8, &i, 2);
+    memcpy(pkt + 10, &count, 2);
+    uint32_t bl = len;
+    memcpy(pkt + 12, &bl, 4);
+    memcpy(pkt + 16, &g_boot_id, 4);
+    memcpy(pkt + SSF_HDR, blob + off, n);
+    if (!make_tag(pkt, SSF_HDR + n, pkt + SSF_HDR + n)) {
+        return 0;
+    }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        xSemaphoreTake(s_sent, 0);
+        if (esp_now_send(dst, pkt, SSF_HDR + n + TAG_LEN) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (xSemaphoreTake(s_sent, pdMS_TO_TICKS(200)) == pdTRUE &&
+            s_send_status == ESP_NOW_SEND_SUCCESS) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Sends every piece, then resends only the pieces that failed, for up to 4
+ * rounds. Returns -1 if the Anchor looks gone (3 failures in a row), else the
+ * number of pieces still unacknowledged (0 = delivered). A fragment is never
+ * reported delivered with holes: the caller keeps it and retries later, and
+ * the Anchor merges pieces it already has. */
+static uint16_t s_failed[(RING * 2 + BEACON_LOG * sizeof(ssm_beacon_t) + 512) / SSF_CHUNK + 8];
+
 static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
 {
     const uint8_t *dst = g_anchor_mac;
@@ -146,41 +198,114 @@ static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
         esp_now_add_peer(&peer);
     }
     uint16_t count = (len + SSF_CHUNK - 1) / SSF_CHUNK;
-    uint8_t pkt[SSF_HDR + SSF_CHUNK + TAG_LEN];
-    int failed = 0, run = 0;
-    for (uint16_t i = 0; i < count && run < 3; i++) {
-        size_t off = (size_t)i * SSF_CHUNK, n = len - off < SSF_CHUNK ? len - off : SSF_CHUNK;
-        memcpy(pkt, "SSF1", 4);
-        memcpy(pkt + 4, &frag_id, 4);
-        memcpy(pkt + 8, &i, 2);
-        memcpy(pkt + 10, &count, 2);
-        uint32_t bl = len;
-        memcpy(pkt + 12, &bl, 4);
-        memcpy(pkt + 16, &g_boot_id, 4);
-        memcpy(pkt + SSF_HDR, blob + off, n);
-        if (!make_tag(pkt, SSF_HDR + n, pkt + SSF_HDR + n)) {
-            failed++;
+    if (count > sizeof s_failed / sizeof s_failed[0]) {
+        return -1;
+    }
+    int nfail = 0, run = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        if (send_piece(dst, blob, len, frag_id, i, count)) {
+            run = 0;
             continue;
         }
-        int ok = 0;
-        for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-            if (esp_now_send(dst, pkt, SSF_HDR + n + TAG_LEN) != ESP_OK) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            if (xSemaphoreTake(s_sent, pdMS_TO_TICKS(200)) == pdTRUE &&
-                s_send_status == ESP_NOW_SEND_SUCCESS) {
-                ok = 1;
-            }
-        }
-        if (!ok) {
-            failed++;
-            run++;
-        } else {
-            run = 0;
+        s_failed[nfail++] = i;
+        if (++run >= 3) {
+            return -1;
         }
     }
-    return run >= 3 ? -1 : failed;
+    for (int round = 0; round < 4 && nfail; round++) {
+        vTaskDelay(pdMS_TO_TICKS(20 * (round + 1)));
+        int still = 0;
+        for (int k = 0; k < nfail; k++) {
+            if (!send_piece(dst, blob, len, frag_id, s_failed[k], count)) {
+                s_failed[still++] = s_failed[k];
+            }
+        }
+        nlogf("R,%lu,round=%d,resent=%d,still=%d\n", (unsigned long)frag_id, round + 1, nfail, still);
+        nfail = still;
+    }
+    return nfail;
+}
+
+/* Node log over the radio. Event lines (D detection, S send, N resend, R
+ * resend round, W warning, H heartbeat, B boot) and ESP_LOG output (prefixed
+ * "L,") collect in a buffer that the sender task ships to the Anchor as signed
+ * SSF1 pieces with frag_id = 0x80000000 | sequence, so the dongle forwards
+ * them unchanged and the Anchor prints them (wendy device logs). A gap in the
+ * sequence at the Anchor means log frames were lost; the node counts lines it
+ * had no room for ("logdrop" in the H line). */
+#define NLOG_SIZE 8192
+static char s_nlog[NLOG_SIZE];
+static size_t s_nlog_len;
+static portMUX_TYPE s_nlog_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_nlog_seq, s_nlog_dropped;
+static vprintf_like_t s_prev_vprintf;
+static volatile int s_trace_radio;
+
+static void nlog_append(const char *buf, size_t n)
+{
+    portENTER_CRITICAL(&s_nlog_lock);
+    if (s_nlog_len + n <= NLOG_SIZE) {
+        memcpy(s_nlog + s_nlog_len, buf, n);
+        s_nlog_len += n;
+    } else {
+        s_nlog_dropped++;
+    }
+    portEXIT_CRITICAL(&s_nlog_lock);
+}
+
+/* printf to the USB console and append to the radio log */
+static void nlogf(const char *fmt, ...)
+{
+    char buf[224];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof buf) {
+        n = sizeof buf - 1;
+        buf[n - 1] = '\n';
+    }
+    fputs(buf, stdout);
+    nlog_append(buf, n);
+}
+
+static int nlog_vprintf(const char *fmt, va_list ap)
+{
+    char buf[224];
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(buf + 2, sizeof buf - 2, fmt, ap2);
+    va_end(ap2);
+    if (n > 0) {
+        buf[0] = 'L';
+        buf[1] = ',';
+        n += 2;
+        if (n >= (int)sizeof buf) {
+            n = sizeof buf - 1;
+            buf[n - 1] = '\n';
+        }
+        nlog_append(buf, n);
+    }
+    return s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+}
+
+static const char *reset_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_USB: return "usb";
+    case ESP_RST_JTAG: return "jtag";
+    default: return "other";
+    }
 }
 
 static int anchor_fresh(void)
@@ -194,7 +319,128 @@ static int anchor_fresh(void)
  * the Anchor merges pieces it already has. Delivery is asynchronous by design:
  * every sample carries its own timestamps. */
 #define OUTBOX 16
-typedef struct { uint8_t *blob; size_t len; uint32_t id; int tries; } outbox_t;
+typedef struct { uint8_t *blob; size_t len; uint32_t id; int tries; int64_t ready_us; } outbox_t;
+
+/* Delivered fragments stay here a while so the Anchor can ask for pieces its
+ * dongle acknowledged but never passed on (SSN1, see proto.h). */
+#define RECENT 6
+static outbox_t s_recent[RECENT];
+static int s_recent_next;
+typedef struct { uint32_t frag; uint16_t n; uint16_t idx[SSN_MAX]; } nack_t;
+static QueueHandle_t s_nacks;
+
+void nack_received(const uint8_t *src, const uint8_t *data, int len)
+{
+    (void)src;
+    uint32_t boot, frag;
+    uint16_t n;
+    memcpy(&boot, data + 4, 4);
+    memcpy(&frag, data + 8, 4);
+    memcpy(&n, data + 12, 2);
+    if (!s_nacks || boot != g_boot_id || n == 0 || n > SSN_MAX || len != SSN_HDR + 2 * n + TAG_LEN ||
+        !tag_ok(data, len)) {
+        return;
+    }
+    nack_t k = {.frag = frag, .n = n};
+    memcpy(k.idx, data + SSN_HDR, 2 * n);
+    xQueueSend(s_nacks, &k, 0);
+}
+
+static void keep_recent(outbox_t *o)
+{
+    outbox_t *r = &s_recent[s_recent_next];
+    free(r->blob);
+    *r = *o;
+    s_recent_next = (s_recent_next + 1) % RECENT;
+}
+
+static int send_piece(const uint8_t *dst, const uint8_t *blob, size_t len, uint32_t frag_id, uint16_t i, uint16_t count);
+
+static void serve_nacks(outbox_t *box, int head, int n)
+{
+    nack_t k;
+    while (xQueueReceive(s_nacks, &k, 0) == pdTRUE) {
+        const outbox_t *o = NULL;
+        for (int i = 0; i < RECENT && !o; i++) {
+            if (s_recent[i].blob && s_recent[i].id == k.frag) o = &s_recent[i];
+        }
+        for (int i = 0; i < n && !o; i++) {
+            if (box[(head + i) % OUTBOX].id == k.frag) o = &box[(head + i) % OUTBOX];
+        }
+        if (!o) {
+            nlogf("N,%lu,asked=%u,gone\n", (unsigned long)k.frag, k.n);
+            continue;
+        }
+        uint16_t count = (o->len + SSF_CHUNK - 1) / SSF_CHUNK;
+        int ok = 0;
+        for (int i = 0; i < k.n; i++) {
+            if (k.idx[i] < count) ok += send_piece(g_anchor_mac, o->blob, o->len, o->id, k.idx[i], count);
+        }
+        nlogf("N,%lu,asked=%u,resent=%d\n", (unsigned long)k.frag, k.n, ok);
+    }
+}
+
+static void ensure_peer(const uint8_t *dst)
+{
+    if (!esp_now_is_peer_exist(dst)) {
+        esp_now_peer_info_t peer = {.channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false};
+        memcpy(peer.peer_addr, dst, 6);
+        esp_now_add_peer(&peer);
+    }
+}
+
+/* Ship whole log lines, up to one piece, at most every 500 ms (sooner when the
+ * buffer is filling). A frame stays queued until its piece is acknowledged. */
+static void flush_log(int outbox_n)
+{
+    static int64_t last_flush, last_beat;
+    int64_t now = esp_timer_get_time();
+    if (now - last_beat > 10000000) {
+        last_beat = now;
+        nlogf("H,up=%llds,outbox=%d,logdrop=%lu,psram_free=%u\n", (long long)(now / 1000000), outbox_n,
+              (unsigned long)s_nlog_dropped, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+    if (!anchor_fresh() || (now - last_flush < 500000 && s_nlog_len < NLOG_SIZE / 2)) return;
+    static uint8_t blob[SSF_CHUNK];
+    size_t n;
+    portENTER_CRITICAL(&s_nlog_lock);
+    n = s_nlog_len;
+    if (n > SSF_CHUNK) {
+        n = SSF_CHUNK;
+        while (n > 0 && s_nlog[n - 1] != '\n') n--;
+        if (n == 0) n = SSF_CHUNK;
+    }
+    memcpy(blob, s_nlog, n);
+    portEXIT_CRITICAL(&s_nlog_lock);
+    if (!n) return;
+    last_flush = now;
+    ensure_peer(g_anchor_mac);
+    if (send_piece(g_anchor_mac, blob, n, 0x80000000u | (s_nlog_seq & 0x7fffffffu), 0, 1)) {
+        portENTER_CRITICAL(&s_nlog_lock);
+        memmove(s_nlog, s_nlog + n, s_nlog_len - n);
+        s_nlog_len -= n;
+        portEXIT_CRITICAL(&s_nlog_lock);
+        s_nlog_seq++;
+    }
+}
+
+static void accept_job(outbox_t *box, int *head, int *n, const job_t *j)
+{
+    uint8_t *blob = NULL;
+    size_t len = build_blob(&blob, j->id, j->first, j->ns, j->trig, j->hit);
+    if (!blob) {
+        nlogf("W,no memory for fragment %lu\n", (unsigned long)j->id);
+        return;
+    }
+    if (*n == OUTBOX) {
+        nlogf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[*head].id);
+        free(box[*head].blob);
+        *head = (*head + 1) % OUTBOX;
+        (*n)--;
+    }
+    box[(*head + *n) % OUTBOX] = (outbox_t){blob, len, j->id, 0, esp_timer_get_time()};
+    (*n)++;
+}
 
 static void sender_task(void *arg)
 {
@@ -202,36 +448,45 @@ static void sender_task(void *arg)
     static outbox_t box[OUTBOX];
     int head = 0, n = 0;
     job_t j;
+    uint32_t slot_waited = 0;
     for (;;) {
         /* take new jobs; don't block while something waits to go out */
-        while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(500)) == pdTRUE) {
-            uint8_t *blob = NULL;
-            size_t len = build_blob(&blob, j.id, j.first, j.ns, j.trig, j.hit);
-            if (!blob) {
-                printf("W,no memory for fragment %lu\n", (unsigned long)j.id);
-                continue;
-            }
-            if (n == OUTBOX) {
-                printf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[head].id);
-                free(box[head].blob);
-                head = (head + 1) % OUTBOX;
-                n--;
-            }
-            box[(head + n) % OUTBOX] = (outbox_t){blob, len, j.id, 0};
-            n++;
+        serve_nacks(box, head, n);
+        flush_log(n);
+        while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(100)) == pdTRUE) {
+            accept_job(box, &head, &n, &j);
         }
         if (!n) continue;
         if (!anchor_fresh()) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
+        int64_t until = box[head].ready_us + (int64_t)s_send_slot * SLOT_MS * 1000;
+        if (box[head].tries == 0 && s_send_slot > 0 && slot_waited != box[head].id && esp_timer_get_time() < until) {
+            /* A fresh fragment waits for this node's slot after it finished
+             * recording, so nodes that heard the same sound do not all start
+             * at once; a fragment that has already waited in the outbox goes
+             * immediately. Finished recordings keep being copied out of the
+             * 4 s audio ring meanwhile. */
+            slot_waited = box[head].id;
+            for (int64_t left; (left = until - esp_timer_get_time()) > 0;) {
+                if (xQueueReceive(s_jobs, &j, pdMS_TO_TICKS(left / 1000 + 1)) == pdTRUE) {
+                    accept_job(box, &head, &n, &j);
+                }
+            }
+            continue; /* the head may have changed if the outbox overflowed */
+        }
         outbox_t *o = &box[head];
         int64_t t0 = esp_timer_get_time();
         int r = send_blob(o->blob, o->len, o->id);
         o->tries++;
-        printf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
+        nlogf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
                (unsigned)((o->len + SSF_CHUNK - 1) / SSF_CHUNK), r, (long long)(esp_timer_get_time() - t0), o->tries, n - 1);
-        if (r >= 0 || o->tries >= 20) {
+        if (r == 0) {
+            keep_recent(o);
+            head = (head + 1) % OUTBOX;
+            n--;
+        } else if (o->tries >= 20) {
             free(o->blob);
             head = (head + 1) % OUTBOX;
             n--;
@@ -247,10 +502,21 @@ static void audio_task(void *arg)
     int16_t blk[BLOCK];
     int stamp_i = 0;
     uint32_t read_blocks = 0;
-    int pending = 0;          /* a trigger is waiting for its post-roll */
-    int64_t trig_n = 0, holdoff_until = 0;
-    uint32_t trig_hit = 0;
+    /* Triggers waiting for their post-roll. Each new onset (the bands going
+     * from quiet to over threshold) at least RETRIGGER_MS after the previous
+     * one gets its own fragment, even while an earlier fragment is still
+     * recording, so a sound right after another one is not missed. */
+#define MAX_PENDING 3
+#define RETRIGGER_MS 250
+    int npend = 0;
+    int64_t pend_n[MAX_PENDING];
+    uint32_t pend_hit[MAX_PENDING];
+    int prev_fire = 0;
+    int64_t last_trig = -(int64_t)RATE * 10;
     int64_t last_print = 0;
+    int tr_blocks = 0, tr_maxhits = 0, tr_fire = 0, tr_onset = 0;
+    float tr_maxexc = -99.0f;
+    int64_t tr_n0 = 0;
     for (;;) {
         size_t got = 0;
         if (i2s_channel_read(s_rx, blk, sizeof blk, &got, 200) != ESP_OK || got != sizeof blk) continue;
@@ -284,8 +550,27 @@ static void audio_task(void *arg)
                 bd->hits = 0;
             }
             if (bd->hits >= s_need_blocks) over |= 1u << b;
-            /* the floor learns only from quiet blocks, so a long sound does not raise it */
-            if (!pending && bd->hits == 0) bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
+            float exc = bd->level_db - bd->floor_db;
+            if (exc > tr_maxexc) tr_maxexc = exc;
+            if (bd->hits > tr_maxhits) tr_maxhits = bd->hits;
+            /* The floor learns only from quiet blocks: no fragment recording, the
+             * smoothed level not over threshold, and the raw block power itself
+             * under threshold. Without the last test the first block of every
+             * sound (raw power high, smoothed level not yet over) was learned,
+             * and sounds 2 s apart ratcheted the floor up until they no longer
+             * triggered (measured: -4.5 dB to +13.8 dB over 20 beeps).
+             * A faster fall (0.4 s) for every quieter block was tried: the floor
+             * then tracked the gaps in room noise and room sounds triggered 2.5
+             * times as often.
+             * But a floor more than 10 dB above the current block (a loud first
+             * block after boot started it at +22.8 dB and it took 40 s to
+             * settle) falls at 0.05 per block, about 0.4 s. */
+            int quiet_block = 10.0f * log10f(pw) < bd->floor_db + bd->thr_db;
+            if (pw < 0.1f * bd->floor_p) {
+                bd->floor_p += 0.05f * (pw - bd->floor_p);
+            } else if (!npend && bd->hits == 0 && quiet_block) {
+                bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
+            }
         }
         uint32_t all = s_nbands >= 32 ? 0xffffffffu : ((1u << s_nbands) - 1);
         int fire = s_nbands && (s_mode_all ? over == all : over != 0);
@@ -296,21 +581,49 @@ static void audio_task(void *arg)
             for (int b = 0; b < s_nbands; b++) printf(",%.0f:%.1f/%.1f", s_bands[b].hz, s_bands[b].level_db, s_bands[b].floor_db);
             printf("\n");
         }
-        if (s_enabled && fire && !pending && n0 >= holdoff_until) {
-            pending = 1;
-            trig_n = n0;
-            trig_hit = over;
-            printf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + 1), (long long)trig_n, (unsigned long)over);
+        int onset = fire && !prev_fire;
+        prev_fire = fire;
+        if (s_trace) {
+            if (tr_blocks == 0) tr_n0 = n0;
+            tr_fire |= (fire ? 1 : 0) << tr_blocks;
+            tr_onset |= (onset ? 1 : 0) << tr_blocks;
+            if (++tr_blocks == 5) {
+                if (s_trace_radio) {
+                    nlogf("V,%lld,%d,%d,%d,%d,%d,%d\n", (long long)tr_n0, (int)(tr_maxexc * 10), tr_maxhits, tr_fire,
+                       tr_onset, npend, s_nbands ? (int)(s_bands[0].floor_db * 10) : 0);
+                } else {
+                    printf("V,%lld,%d,%d,%d,%d,%d,%d\n", (long long)tr_n0, (int)(tr_maxexc * 10), tr_maxhits, tr_fire,
+                       tr_onset, npend, s_nbands ? (int)(s_bands[0].floor_db * 10) : 0);
+                }
+                tr_blocks = tr_maxhits = tr_fire = tr_onset = 0;
+                tr_maxexc = -99.0f;
+            }
         }
-        if (pending && s_n >= trig_n + (int64_t)s_post_ms * RATE / 1000) {
-            pending = 0;
+        if (s_enabled && onset && n0 - last_trig >= (int64_t)RETRIGGER_MS * RATE / 1000) {
+            if (npend < MAX_PENDING) {
+                pend_n[npend] = n0;
+                pend_hit[npend] = over;
+                npend++;
+                last_trig = n0;
+                nlogf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + npend), (long long)n0, (unsigned long)over);
+            } else {
+                nlogf("W,trigger skipped, %d fragments already recording\n", npend);
+            }
+        }
+        /* oldest first: emit every pending fragment whose post-roll is in */
+        while (npend && s_n >= pend_n[0] + (int64_t)s_post_ms * RATE / 1000) {
+            int64_t trig_n = pend_n[0];
             int64_t first = trig_n - (int64_t)s_pre_ms * RATE / 1000;
             if (first < 0) first = 0;
             uint32_t ns = (uint32_t)(s_n - first);
             if (ns > RING - BLOCK * 4) ns = RING - BLOCK * 4;
-            job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = trig_hit, .id = ++s_frag_id};
-            if (xQueueSend(s_jobs, &j, 0) != pdTRUE) printf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
-            holdoff_until = s_n + RATE / 2;
+            job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = pend_hit[0], .id = ++s_frag_id};
+            if (xQueueSend(s_jobs, &j, 0) != pdTRUE) nlogf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
+            for (int i = 1; i < npend; i++) {
+                pend_n[i - 1] = pend_n[i];
+                pend_hit[i - 1] = pend_hit[i];
+            }
+            npend--;
         }
     }
 }
@@ -449,6 +762,10 @@ int audio_command(const char *line)
     if (!strcmp(line, "mode all")) { s_mode_all = 1; return 1; }
     if (!strcmp(line, "force")) { s_force = 1; return 1; }
     if (!strcmp(line, "levels on")) { s_print_levels = 1; return 1; }
+    if (!strcmp(line, "trace on")) { s_trace = 1; return 1; }
+    if (!strcmp(line, "trace radio on")) { s_trace = 1; s_trace_radio = 1; return 1; }
+    if (!strcmp(line, "trace radio off")) { s_trace_radio = 0; return 1; }
+    if (!strcmp(line, "trace off")) { s_trace = 0; return 1; }
     if (!strcmp(line, "levels off")) { s_print_levels = 0; return 1; }
     if (!strcmp(line, "audio on")) { s_enabled = 1; return 1; }
     if (!strcmp(line, "audio off")) { s_enabled = 0; return 1; }
@@ -456,8 +773,9 @@ int audio_command(const char *line)
     if (sscanf(line, "pre %d", &v) == 1) { s_pre_ms = v; return 1; }
     if (sscanf(line, "post %d", &v) == 1) { s_post_ms = v; return 1; }
     if (sscanf(line, "blocks %d", &v) == 1) { s_need_blocks = v; return 1; }
+    if (sscanf(line, "slot %d", &v) == 1) { s_send_slot = v < 0 ? 0 : v; return 1; }
     if (!strcmp(line, "bands")) {
-        printf("B,mode=%s,blocks=%d,pre=%d,post=%d", s_mode_all ? "all" : "any", s_need_blocks, s_pre_ms, s_post_ms);
+        printf("B,mode=%s,blocks=%d,pre=%d,post=%d,slot=%d", s_mode_all ? "all" : "any", s_need_blocks, s_pre_ms, s_post_ms, s_send_slot);
         for (int i = 0; i < s_nbands; i++) printf(",%.0fHz+%.1fdB", s_bands[i].hz, s_bands[i].thr_db);
         printf("\n");
         return 1;
@@ -467,12 +785,24 @@ int audio_command(const char *line)
 
 void audio_start(void)
 {
+    s_prev_vprintf = esp_log_set_vprintf(nlog_vprintf);
+    nlogf("B,boot=%08lx,reset=%s\n", (unsigned long)g_boot_id, reset_name(esp_reset_reason()));
     s_ring = heap_caps_calloc(RING, sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_sent = xSemaphoreCreateBinary();
     esp_now_register_send_cb(send_cb);
-    /* Default: broadband energy 10 dB over its floor. */
-    s_bands[0] = (band_t){.hz = 0, .thr_db = 10};
+    /* Defaults that work without a laptop: the base station's code reaches
+     * about +25 dB at 2.7 kHz (the buzzer's resonance); 1.8 kHz mostly caught
+     * room noise. +12 dB doubled room triggers and swamped the radio; +15 dB
+     * held over three 20 ms blocks keeps the 235 ms code and drops short room
+     * sounds (clicks, syllables). */
+    s_bands[0] = (band_t){.hz = 2700, .thr_db = 15};
     s_nbands = 1;
+    s_need_blocks = 3;
+    /* Send slot from this board's MAC, so nodes that hear the same sound do
+     * not all send at once: the dongle's USB link drops pieces when they do. */
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    s_send_slot = (mac[4] ^ mac[5]) % 4;
 
     i2s_chan_config_t cc = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     cc.dma_frame_num = BLOCK;
@@ -487,7 +817,8 @@ void audio_start(void)
     i2s_event_callbacks_t cbs = {.on_recv = on_dma_recv};
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
-    s_jobs = xQueueCreate(4, sizeof(job_t));
+    s_jobs = xQueueCreate(8, sizeof(job_t));
+    s_nacks = xQueueCreate(8, sizeof(nack_t));
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 12, NULL, 1);
     xTaskCreatePinnedToCore(sender_task, "sender", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(beep_task, "beep", 3072, NULL, 5, NULL, 0);

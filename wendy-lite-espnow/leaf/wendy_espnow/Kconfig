@@ -1,0 +1,36 @@
+menu "Wendy ESP-NOW link"
+    config WENDY_ESPNOW
+        bool "ESP-NOW link: time-sync beacons and a carrier for the mesh leaf"
+        default n
+        depends on WENDY_WIFI_ENABLED
+        help
+            Listens for signed soundsync beacons (SSB1) from an Anchor dongle
+            and logs their hardware receive time on the esp_timer clock, the
+            reference-broadcast time sync of the acoustic nodes. Beacons stay
+            plain ESP-NOW broadcasts so their receive stamps are untouched.
+
+            Also carries the signed mesh leaf: a TCP listener on 127.0.0.1
+            whose bytes travel over a reliable ESP-NOW stream to the Anchor,
+            which relays them to its WendyOS agent's leaf listener. The leaf's
+            mutually authenticated TLS runs end to end over it. Hackathon
+            feature.
+
+    config WENDY_ESPNOW_PROXY_PORT
+        int "Local TCP port of the mesh carrier proxy"
+        depends on WENDY_ESPNOW
+        default 43124
+
+    config WENDY_ESPNOW_LOG_BEACONS
+        bool "Log every beacon's receive time (B lines)"
+        depends on WENDY_ESPNOW
+        default y
+
+    config WENDY_ESPNOW_LOG_AP_BEACONS
+        bool "Also log the receive time of the associated AP's beacons (A lines)"
+        depends on WENDY_ESPNOW
+        default n
+        help
+            For measuring time sync against any other receiver on the channel,
+            without a second node. Turns promiscuous receive of management
+            frames on.
+endmenu
