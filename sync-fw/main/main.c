@@ -313,6 +313,10 @@ static void beacon_task(void *arg)
     }
 }
 
+static int s_drive_pin = -1;
+volatile int g_gpio_trigger; /* "gpiotrig on": an input edge forces a fragment */
+extern void audio_force_from_isr(void);
+
 static void IRAM_ATTR gpio_isr(void *arg)
 {
     int pin = (int)(intptr_t)arg;
@@ -322,10 +326,14 @@ static void IRAM_ATTR gpio_isr(void *arg)
     if (xQueueSendFromISR(s_q, &e, &woken) != pdTRUE) {
         s_drops++;
     }
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (g_gpio_trigger && pin != s_drive_pin) {
+        audio_force_from_isr();
+    }
+#endif
     portYIELD_FROM_ISR(woken);
 }
 
-static int s_drive_pin = -1;
 static int s_drive_level = 1;
 static esp_timer_handle_t s_drive_timer;
 
@@ -421,6 +429,10 @@ static void cmd_task(void *arg)
             s_ap_log = true;
         } else if (!strcmp(line, "ap off")) {
             s_ap_log = false;
+        } else if (!strcmp(line, "gpiotrig on")) {
+            g_gpio_trigger = 1;
+        } else if (!strcmp(line, "gpiotrig off")) {
+            g_gpio_trigger = 0;
         } else if (!strncmp(line, "gpio ", 5)) {
             attach_isr(atoi(line + 5), GPIO_MODE_INPUT);
         } else if (!strncmp(line, "drive ", 6)) {

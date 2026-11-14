@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2s_pdm.h"
+#include "rom/ets_sys.h"
 #include "esp_heap_caps.h"
 #include "esp_mac.h"
 #include "esp_now.h"
@@ -32,6 +34,19 @@ typedef struct {
 } band_t;
 
 static i2s_chan_handle_t s_rx;
+/* Completion time of every DMA buffer (one 20 ms block each), stamped in the
+ * I2S interrupt: independent of when the capture task gets to run. */
+#define DMA_STAMPS 64
+static volatile int64_t s_dma_done[DMA_STAMPS];
+static volatile uint32_t s_dma_count;
+
+static bool IRAM_ATTR on_dma_recv(i2s_chan_handle_t h, i2s_event_data_t *ev, void *ctx)
+{
+    (void)h; (void)ev; (void)ctx;
+    s_dma_done[s_dma_count % DMA_STAMPS] = esp_timer_get_time();
+    s_dma_count++;
+    return false;
+}
 static int16_t *s_ring;
 static ssm_stamp_t s_stamps[STAMPS];
 static volatile int64_t s_n; /* samples captured so far */
@@ -231,6 +246,7 @@ static void audio_task(void *arg)
     (void)arg;
     int16_t blk[BLOCK];
     int stamp_i = 0;
+    uint32_t read_blocks = 0;
     int pending = 0;          /* a trigger is waiting for its post-roll */
     int64_t trig_n = 0, holdoff_until = 0;
     uint32_t trig_hit = 0;
@@ -240,7 +256,15 @@ static void audio_task(void *arg)
         if (i2s_channel_read(s_rx, blk, sizeof blk, &got, 200) != ESP_OK || got != sizeof blk) continue;
         int64_t now = esp_timer_get_time();
         int64_t n0 = s_n;
-        s_stamps[stamp_i] = (ssm_stamp_t){.n = n0, .esp_us = now - (int64_t)BLOCK * 1000000 / RATE};
+        /* Reads return DMA buffers in order, so this block is the
+         * read_blocks-th completed buffer. If capture fell further behind than
+         * the DMA queue (dropped buffers), resynchronise to the newest one. */
+        uint32_t done = s_dma_count;
+        if (done - read_blocks > 8 || read_blocks >= done) read_blocks = done - 1;
+        int64_t completed = s_dma_done[read_blocks % DMA_STAMPS];
+        read_blocks++;
+        if (completed <= 0 || completed > now) completed = now;
+        s_stamps[stamp_i] = (ssm_stamp_t){.n = n0, .esp_us = completed - (int64_t)BLOCK * 1000000 / RATE};
         stamp_i = (stamp_i + 1) % STAMPS;
         for (int i = 0; i < BLOCK; i++) s_ring[(n0 + i) % RING] = blk[i];
         s_n = n0 + BLOCK;
@@ -291,8 +315,128 @@ static void audio_task(void *arg)
     }
 }
 
+void IRAM_ATTR audio_force_from_isr(void)
+{
+    s_force = 1;
+}
+
+/* Ground truth for audio timestamps: play a tone burst on a buzzer next to
+ * the microphone and stamp its first edge on esp_timer. The burst is
+ * bit-banged with interrupts held off, so the stamp is the true start to about
+ * a microsecond. Prints "K,<pin>,<hz>,<cycles>,<esp_us of first edge>". */
+static int s_beep_pin = -1, s_beep_hz = 4000, s_beep_cycles = 20, s_beep_every_ms;
+/* Chirp mode: a linear sweep f0 -> f1 over dur_us has no repeating shape, so
+ * its correlation peak is unique (a steady tone repeats every half cycle). */
+static int s_chirp_f0, s_chirp_f1, s_chirp_us;
+#define CHIRP_MAX_TOGGLES 400
+static uint16_t s_chirp_gap[CHIRP_MAX_TOGGLES]; /* us between toggles */
+static int s_chirp_n;
+
+static void chirp_plan(void)
+{
+    /* toggle where the phase 2*pi*(f0*t + (f1-f0)*t^2/(2T)) crosses k*pi */
+    double T = s_chirp_us * 1e-6, f0 = s_chirp_f0, k1 = (s_chirp_f1 - s_chirp_f0) / T;
+    double prev = 0;
+    s_chirp_n = 0;
+    for (int k = 1; s_chirp_n < CHIRP_MAX_TOGGLES; k++) {
+        /* solve f0 t + k1 t^2 / 2 = k / 2 */
+        double t = (-f0 + sqrt(f0 * f0 + k1 * k)) / k1;
+        if (t > T) break;
+        s_chirp_gap[s_chirp_n++] = (uint16_t)llround((t - prev) * 1e6);
+        prev = t;
+    }
+}
+#define BEEP_LOG 64
+static int64_t s_beep_log[BEEP_LOG]; /* stamps kept for "beeps": serial lines can drop */
+static uint32_t s_beep_count;
+
+static void beep_once(void)
+{
+    if (s_beep_pin < 0) return;
+    int half = 500000 / s_beep_hz;
+    s_force = 1; /* capture a fragment around it */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&mux);
+    int64_t t = esp_timer_get_time();
+    if (s_chirp_us) {
+        int level = 1;
+        gpio_set_level(s_beep_pin, level);
+        for (int i = 0; i < s_chirp_n; i++) {
+            esp_rom_delay_us(s_chirp_gap[i]);
+            level = !level;
+            gpio_set_level(s_beep_pin, level);
+        }
+        gpio_set_level(s_beep_pin, 0);
+    } else {
+        for (int c = 0; c < s_beep_cycles; c++) {
+            gpio_set_level(s_beep_pin, 1);
+            esp_rom_delay_us(half);
+            gpio_set_level(s_beep_pin, 0);
+            esp_rom_delay_us(half);
+        }
+    }
+    portEXIT_CRITICAL(&mux);
+    s_beep_log[s_beep_count % BEEP_LOG] = t;
+    s_beep_count++;
+    if (s_chirp_us)
+        printf("Q,%d,%d,%d,%d,%lld\n", s_beep_pin, s_chirp_f0, s_chirp_f1, s_chirp_us, (long long)t);
+    else
+        printf("K,%d,%d,%d,%lld\n", s_beep_pin, s_beep_hz, s_beep_cycles, (long long)t);
+}
+
+static void beep_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (s_beep_every_ms > 0) {
+            beep_once();
+            vTaskDelay(pdMS_TO_TICKS(s_beep_every_ms));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
 int audio_command(const char *line)
 {
+    int bp, bh = 4000, bc = 20;
+    if (sscanf(line, "beeppin %d", &bp) == 1) {
+        gpio_config_t c = {.pin_bit_mask = 1ULL << bp, .mode = GPIO_MODE_OUTPUT};
+        gpio_config(&c);
+        gpio_set_level(bp, 0);
+        s_beep_pin = bp;
+        return 1;
+    }
+    if (sscanf(line, "beep %d %d", &bh, &bc) >= 1 || !strcmp(line, "beep")) {
+        if (bh > 100 && bh < 16000) s_beep_hz = bh;
+        if (bc > 0 && bc < 400) s_beep_cycles = bc;
+        beep_once();
+        return 1;
+    }
+    int c0, c1, cus;
+    if (sscanf(line, "chirp %d %d %d", &c0, &c1, &cus) == 3) {
+        s_chirp_f0 = c0; s_chirp_f1 = c1; s_chirp_us = cus;
+        if (cus > 0) chirp_plan();
+        printf("C,%d toggles\n", s_chirp_n);
+        return 1;
+    }
+    if (!strcmp(line, "beeps")) {
+        uint32_t n = s_beep_count < BEEP_LOG ? s_beep_count : BEEP_LOG;
+        for (uint32_t i = s_beep_count - n; i < s_beep_count; i++) {
+            if (s_chirp_us)
+                printf("Q,%d,%d,%d,%d,%lld\n", s_beep_pin, s_chirp_f0, s_chirp_f1, s_chirp_us, (long long)s_beep_log[i % BEEP_LOG]);
+            else
+                printf("K,%d,%d,%d,%lld\n", s_beep_pin, s_beep_hz, s_beep_cycles, (long long)s_beep_log[i % BEEP_LOG]);
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        printf("KEND,%lu\n", (unsigned long)s_beep_count);
+        return 1;
+    }
+    if (sscanf(line, "beepevery %d", &bp) == 1) {
+        s_beep_every_ms = bp;
+        return 1;
+    }
     float hz, db;
     if (sscanf(line, "band %f %f", &hz, &db) == 2) {
         for (int i = 0; i < s_nbands; i++)
@@ -340,8 +484,11 @@ void audio_start(void)
         .gpio_cfg = {.clk = GPIO_NUM_42, .din = GPIO_NUM_41},
     };
     ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(s_rx, &pc));
+    i2s_event_callbacks_t cbs = {.on_recv = on_dma_recv};
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
     s_jobs = xQueueCreate(4, sizeof(job_t));
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 12, NULL, 1);
     xTaskCreatePinnedToCore(sender_task, "sender", 8192, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(beep_task, "beep", 3072, NULL, 5, NULL, 0);
 }

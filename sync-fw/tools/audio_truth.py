@@ -23,7 +23,7 @@ travel_us = dist_cm / 100 / 343 * 1e6
 edges = []
 for line in open(cap):
     p = line.strip().split(",")
-    if len(p) >= 5 and p[1] == "G" and p[3] == "0":  # contact closes: pull-up -> low
+    if len(p) >= 5 and p[1] == "G":  # any edge; the first of each touch is the contact
         try:
             edges.append(int(p[4]))
         except ValueError:
