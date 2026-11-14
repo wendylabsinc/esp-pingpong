@@ -1,0 +1,15 @@
+{
+  "$schema": "https://wendy.dev/schemas/wendy.json",
+  "appId": "sh.wendy.taploc.box",
+  "version": "0.1.0",
+  "platform": "linux",
+  "language": "python",
+  "env": {
+    "TAPLOC_KEY": "${TAPLOC_KEY}"
+  },
+  "entitlements": [
+    { "type": "network", "mode": "host" },
+    { "type": "http", "port": 8000 },
+    { "type": "persist", "name": "sh.wendy.taploc.box", "path": "/data" }
+  ]
+}

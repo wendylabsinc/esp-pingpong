@@ -1,0 +1,383 @@
+dependencies:
+  esp-pqc:
+    component_hash: aa178966259b09716c703dc759dac0ea960d303cdd947cd35afa30933dbd96c6
+    dependencies:
+    - name: idf
+      version: '>=6.0'
+    - git: https://github.com/espressif/esp-pqc.git
+      name: mbedtls
+      path: components/mbedtls
+      version: 37953195672cbc7502b06fc845fc9219627f31fd
+    source:
+      git: https://github.com/espressif/esp-pqc.git
+      path: .
+      type: git
+    version: 37953195672cbc7502b06fc845fc9219627f31fd
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
+  espressif/mdns:
+    component_hash: 2fa43caa78cc170842255bc7bf71f306bc815cae12e9496bfb12372423019ac7
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.15.1
+  idf:
+    source:
+      type: idf
+    version: 6.0.3
+  mbedtls:
+    component_hash: 83e702283e2e56c5e74c142e181ef36df5bd4e1d2bf69d10c396eaccbf21b156
+    dependencies: []
+    source:
+      git: https://github.com/espressif/esp-pqc.git
+      path: components/mbedtls
+      type: git
+    version: 37953195672cbc7502b06fc845fc9219627f31fd
+  nanopb:
+    component_hash: f76f74d1129f3b69297b085872d3ef8166972d30aaf2a368a2eb17d77b65888c
+    dependencies: []
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/nanopb
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_babel:
+    component_hash: 47a16339464fd60d5b5cfe01e761bf47ebdce21158dd2d967a00693d08ec41c8
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_common
+      path: components/wendy_net_common
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_babel
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_ble:
+    component_hash: 109f7659a31968cde23e37f6aa2e8ce3db781ac53a719c7a9845de214594e499
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_common
+      path: components/wendy_net_common
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_ble
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_cloud:
+    component_hash: 4fc2a0c9cc1dccdcbcf05c017bc369967c0c1ca54cf58c0cbd248a38e1d43ef5
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_cloud
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_com:
+    component_hash: 585afe00675d53a81488f4b887f1e45bdd66a8c3094be062805b2864cdd2a8c2
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: nanopb
+      path: components/nanopb
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_com
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_conf:
+    component_hash: 4f7fa7024d131ad4b9db798537c048f260711c75dfc84ab6a378743ca3f10b41
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: nanopb
+      path: components/nanopb
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_conf
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_core:
+    component_hash: 0e2df43ff3be869cc3911a4d95034f3a73d23f4e24d5409286f04a7db655f3d9
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: nanopb
+      path: components/nanopb
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_stdio
+      path: components/wendy_stdio
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_pki
+      path: components/wendy_pki
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_server
+      path: components/wendy_server
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_cloud
+      path: components/wendy_cloud
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_wasm
+      path: components/wendy_wasm
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_callback
+      path: components/wendy_callback
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_hal
+      path: components/wendy_hal
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_hal_export
+      path: components/wendy_hal_export
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net
+      path: components/wendy_net
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_usj
+      path: components/wendy_usj
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_wifi
+      path: components/wendy_wifi
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_ble
+      path: components/wendy_ble
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_core
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_net_common:
+    component_hash: f34dab500b49fee9621e77c8e66f534f578b9f5ee127910d579989f8cd8c21bc
+    dependencies: []
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_net_common
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_net_gossip:
+    component_hash: d27a94634610da768859d25e7a584b53bb8e6707f2e299cb4aa22427b2744f7d
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_common
+      path: components/wendy_net_common
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_net_gossip
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_net_peer:
+    component_hash: 72757f885f24181337ee7dfb6ddf501a008679e98ad585266c7ba17299d4b9ac
+    dependencies:
+    - name: espressif/cjson
+      version: ^1.7.19
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net
+      path: components/wendy_net
+      rules:
+      - if: target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True && $CONFIG{WENDY_NET} == True
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_babel
+      path: components/wendy_babel
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_ble
+      path: components/wendy_ble
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_common
+      path: components/wendy_net_common
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_gossip
+      path: components/wendy_net_gossip
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_pki
+      path: components/wendy_pki
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_wifi
+      path: components/wendy_wifi
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - name: espressif/mdns
+      version: '*'
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_net_peer
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_pki:
+    component_hash: ee038aef3be6d448157a7a5ef5e4117f32a3f787f5e9c31334ce7cdb64aeac62
+    dependencies:
+    - name: idf
+      version: '>=6.0.3'
+    - git: https://github.com/espressif/esp-pqc.git
+      name: esp-pqc
+      version: 37953195672cbc7502b06fc845fc9219627f31fd
+    - name: espressif/cjson
+      version: ^1.7.19
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_common
+      path: components/wendy_net_common
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_pki
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_server:
+    component_hash: 66635eae76bfd8aa10b503b1f824fb6229493a84826bff49c0ae38bebf8f00cf
+    dependencies:
+    - name: espressif/mdns
+      version: '*'
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_pki
+      path: components/wendy_pki
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_net_peer
+      path: components/wendy_net_peer
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_server
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_stdio:
+    component_hash: c0c2d9c1405c58639e024cb439665a620c788b5ca8204dd91fd4f043f0ef62ae
+    dependencies: []
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_stdio
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_usj:
+    component_hash: fd3091427f89faf7ea0b52a31232f6027d3c168cf47baddfdda5763f5d95065f
+    dependencies:
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_stdio
+      path: components/wendy_stdio
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: nanopb
+      path: components/nanopb
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_usj
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+  wendy_wifi:
+    component_hash: 874d2243edee1360b396963b52c3e95a6caa96df600a134b359ce5782c665012
+    dependencies:
+    - name: idf
+      version: '>=5.1.0'
+    - name: espressif/mdns
+      version: '*'
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_com
+      path: components/wendy_com
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_server
+      path: components/wendy_server
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_cloud
+      path: components/wendy_cloud
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    - git: https://github.com/wendylabsinc/wendy-lite.git
+      name: wendy_conf
+      path: components/wendy_conf
+      version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+    source:
+      git: https://github.com/wendylabsinc/wendy-lite.git
+      path: components/wendy_wifi
+      type: git
+    version: 7a17e9b81b1e892c61aa06321a85257ab2771587
+direct_dependencies:
+- idf
+- wendy_core
+- wendy_net_peer
+manifest_hash: d4b1c58ee76a7264f2d9a6778a0df6b206e4f7d4fc301f6a319b9475599505e0
+target: esp32s3
+version: 3.0.0

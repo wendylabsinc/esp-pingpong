@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tap locator</title>
+<style>
+  :root { --bg:#f5f5f7; --panel:#fff; --line:#d1d1d6; --text:#1d1d1f; --dim:#6e6e73; --accent:#0071e3; --tap:#d97800; --bad:#d70015; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1d1d1f; --panel:#2d2d2f; --line:#48484a; --text:#f5f5f7; --dim:#a1a1a6; --accent:#4aa3ff; --tap:#ffb340; --bad:#ff6961; }
+  }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 8px; }
+  main { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0; }
+  #mapbox { flex:2 1 520px; }
+  aside { flex:1 1 280px; display:flex; flex-direction:column; gap:16px; min-width:0; }
+  svg { width:100%; height:auto; display:block; font:12px system-ui,sans-serif; }
+  table { border-collapse:collapse; width:100%; }
+  td, th { text-align:left; padding:2px 8px 2px 0; vertical-align:top; }
+  th { color:var(--dim); font-weight:500; }
+  .dim { color:var(--dim); } .bad { color:var(--bad); }
+  .num { font-variant-numeric:tabular-nums; }
+  textarea { width:100%; box-sizing:border-box; height:180px; font:12px ui-monospace,monospace; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px; }
+  button { font:inherit; padding:4px 12px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--text); cursor:pointer; }
+  .scroll { overflow-x:auto; }
+</style>
+<h1>Tap locator <span id="status" class="bad"></span></h1>
+<main>
+  <section id="mapbox">
+    <h2>Map (metres, from above)</h2>
+    <svg id="map" viewBox="0 0 640 480" role="img" aria-label="Board positions, measured distances and located taps"></svg>
+    <p class="dim">Solid lines join boards that hear each other's sweeps: the distance that gives, then how well their clocks agree. A long-dashed line joins boards whose clocks agree by radio beacons or calibration taps, with no distance measured.
+      Hollow boards have not been placed by hand and sit where the sweeps put them; a ring shows where the sweeps put a placed board.
+      Dashed lines are each board's link to this box: latency ± jitter. The shaded region around the newest tap is where it lies with 95% confidence.</p>
+  </section>
+  <aside>
+    <section><h2>Clocks and distances</h2><div id="clocks" class="scroll"></div></section>
+    <section><h2>Taps</h2><div id="taps" class="scroll"></div></section>
+    <section><h2>Boards</h2><div id="boards" class="scroll"></div></section>
+    <section>
+      <h2>Positions and temperature</h2>
+      <textarea id="config" spellcheck="false" aria-label="Configuration as JSON"></textarea>
+      <p><button id="save">Save</button> <button id="adopt">Use measured positions</button> <span id="saved" class="dim"></span></p>
+      <p class="dim">x and y in metres. Place two or three boards by hand to fix where the map sits and which way round it is; the sweeps place the rest.
+        self_m is the distance from buzzer to microphone on a board. bias_us shifts one board's arrival time, for calibration. temp_c sets the speed of sound.</p>
+    </section>
+  </aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+const us = v => v == null ? '?' : Math.abs(v) >= 1000 ? (v / 1000).toFixed(2) + ' ms' : v.toFixed(0) + ' µs';
+const cm = v => v == null ? '?' : v < 0.1 ? (v * 100).toFixed(1) + ' cm' : (v * 100).toFixed(0) + ' cm';
+const clock = t => new Date(t / 1000).toISOString().slice(11, 23);
+let dirty = false, last = null;
+$('config').addEventListener('input', () => { dirty = true; $('saved').textContent = 'unsaved changes'; });
+
+function label(s, id) {
+  const b = s.config.boards[id];
+  return b && b.name ? b.name : id.slice(-5);
+}
+
+function drawMap(s) {
+  const byHand = s.config.boards;
+  const placed = Object.entries({ ...s.measured, ...byHand }).map(([id, b]) => ({ id, x: b.x, y: b.y }));
+  if (!placed.length) {
+    $('map').innerHTML = '<text x="320" y="240" text-anchor="middle" fill="var(--dim)">No boards located yet. They appear once they hear each other\'s sweeps.</text>';
+    return;
+  }
+  const cx = placed.reduce((a, b) => a + b.x, 0) / placed.length, cy = placed.reduce((a, b) => a + b.y, 0) / placed.length;
+  const reach = Math.max(1, ...placed.map(b => Math.hypot(b.x - cx, b.y - cy))) * 1.6;
+  const k = 200 / reach, X = x => 320 + (x - cx) * k, Y = y => 240 - (y - cy) * k;
+  const inView = t => Math.abs(X(t.x) - 320) < 310 && Math.abs(Y(t.y) - 240) < 230;
+  let h = '';
+  const step = reach > 20 ? 10 : reach > 8 ? 5 : 1;
+  for (let g = Math.ceil((cx - 320 / k) / step) * step; g <= cx + 320 / k; g += step)
+    h += `<line x1="${X(g)}" y1="0" x2="${X(g)}" y2="480" stroke="var(--line)"/><text x="${X(g) + 3}" y="476" fill="var(--dim)">${g}</text>`;
+  for (let g = Math.ceil((cy - 240 / k) / step) * step; g <= cy + 240 / k; g += step)
+    h += `<line x1="0" y1="${Y(g)}" x2="640" y2="${Y(g)}" stroke="var(--line)"/><text x="3" y="${Y(g) - 3}" fill="var(--dim)">${g}</text>`;
+  const at = Object.fromEntries(placed.map(b => [b.id, b]));
+  for (const n of s.nodes) {
+    const b = at[n.id];
+    if (!b || !n.live || n.box_latency_us == null) continue;
+    h += `<line x1="${X(b.x)}" y1="${Y(b.y)}" x2="600" y2="40" stroke="var(--dim)" stroke-dasharray="5 5"/>`
+       + `<text x="${(X(b.x) + 600) / 2}" y="${(Y(b.y) + 40) / 2 - 4}" text-anchor="middle" fill="var(--dim)">${us(n.box_latency_us)} ± ${us(n.box_jitter_us)}</text>`;
+  }
+  for (const e of s.edges) {
+    const a = at[e.a], b = at[e.b];
+    if (!a || !b) continue;
+    h += `<line x1="${X(a.x)}" y1="${Y(a.y)}" x2="${X(b.x)}" y2="${Y(b.y)}" stroke="var(--accent)" stroke-width="2"${e.distance_m == null ? ' stroke-dasharray="8 4"' : ''}/>`
+       + `<text x="${(X(a.x) + X(b.x)) / 2}" y="${(Y(a.y) + Y(b.y)) / 2 - 6}" text-anchor="middle" fill="var(--text)">`
+       + `<title>clocks from ${esc(e.method)}, ${e.samples} points${e.skew_ppm == null ? '' : ` · drifting apart ${e.skew_ppm.toFixed(1)} ppm`}</title>`
+       + (e.distance_m == null ? '' : `${e.distance_m.toFixed(2)} m ± ${cm(e.distance_sigma_m)} · `) + `±${us(e.sigma_us)} by ${esc(e.method)}</text>`;
+  }
+  for (const [id, m] of Object.entries(s.measured))
+    if (byHand[id] && Math.hypot(m.x - byHand[id].x, m.y - byHand[id].y) * k > 4)
+      h += `<circle cx="${X(m.x)}" cy="${Y(m.y)}" r="9" fill="none" stroke="var(--accent)" stroke-dasharray="3 3"><title>Where the sweeps put ${esc(label(s, id))}</title></circle>`;
+  const fixes = s.taps.filter(t => t.x != null && inView(t)).slice(0, 12);
+  fixes.slice(1).forEach(t => h += `<circle cx="${X(t.x)}" cy="${Y(t.y)}" r="4" fill="var(--dim)" opacity=".6"/>`);
+  if (fixes.length) {
+    const t = fixes[0];
+    h += `<ellipse cx="${X(t.x)}" cy="${Y(t.y)}" rx="${Math.max(3, t.major_m * k)}" ry="${Math.max(3, t.minor_m * k)}" `
+       + `transform="rotate(${-t.angle * 180 / Math.PI} ${X(t.x)} ${Y(t.y)})" fill="var(--tap)" fill-opacity=".25" stroke="var(--tap)"/>`
+       + `<circle cx="${X(t.x)}" cy="${Y(t.y)}" r="5" fill="var(--tap)"/>`
+       + (t.alt && inView(t.alt) ? `<circle cx="${X(t.alt.x)}" cy="${Y(t.alt.y)}" r="5" fill="none" stroke="var(--tap)" stroke-dasharray="2 2"><title>Second position that also fits</title></circle>` : '')
+       + `<text x="${X(t.x)}" y="${Y(t.y) - 12 - Math.min(40, t.minor_m * k)}" text-anchor="middle" fill="var(--text)">(${t.x.toFixed(2)}, ${t.y.toFixed(2)}) ± ${(t.major_m * 100).toFixed(0)} cm</text>`;
+  }
+  const liveIds = new Set(s.nodes.filter(n => n.live).map(n => n.id));
+  for (const b of placed)
+    h += `<circle cx="${X(b.x)}" cy="${Y(b.y)}" r="8" stroke-width="2" stroke="${liveIds.has(b.id) ? 'var(--accent)' : 'var(--dim)'}" fill="${!byHand[b.id] ? 'var(--panel)' : liveIds.has(b.id) ? 'var(--accent)' : 'var(--dim)'}"/>`
+       + `<text x="${X(b.x)}" y="${Y(b.y) + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(label(s, b.id))} (${+b.x.toFixed(2)}, ${+b.y.toFixed(2)})</text>`;
+  h += `<rect x="588" y="28" width="24" height="24" rx="4" fill="var(--dim)"/><text x="600" y="20" text-anchor="middle" font-weight="600" fill="var(--text)">box</text>`;
+  $('map').innerHTML = h;
+}
+
+function drawPanels(s) {
+  const k = s.kernel_clock;
+  let c = `<p class="num">${clock(s.now_us)} UTC `
+        + (k == null ? '<span class="dim">uncertainty unknown here</span>'
+           : !k.synced ? '<span class="bad">box clock not synchronised</span>'
+           : `<strong>± ${us(k.max_error_us)}</strong>`) + '</p>';
+  if (s.edges.length) {
+    c += '<table><tr><th>Boards</th><th>Apart</th><th>Clocks agree</th></tr>';
+    for (const e of s.edges)
+      c += `<tr class="num"><td>${esc(label(s, e.a))} – ${esc(label(s, e.b))}</td><td>${e.distance_m == null ? '<span class="dim">not measured</span>' : `${e.distance_m.toFixed(3)} m ± ${cm(e.distance_sigma_m)}`}</td>`
+         + `<td><strong>± ${us(e.sigma_us)}</strong> <span class="dim">by ${esc(e.method)}</span></td></tr>`;
+    c += '</table>';
+    if (s.edges.some(e => e.distance_m != null)) c += `<p class="num">The distances fit one flat layout to ${cm(s.misfit_m)}.</p>`;
+    if (s.edges.some(e => e.method === 'taps')) c += '<p class="dim">Clocks set by taps drift: the ± grows until you calibrate again.</p>';
+    if (s.edges.some(e => e.method === 'two-way radio')) c += '<p class="dim">Two boards alone can only time beacons sent to each other, which is looser. A third board in radio range tightens it.</p>';
+  } else c += '<p class="dim">The boards\' clocks are not related yet. They need to hear each other\'s radio beacons or sweeps, or press Calibrate here on a board and tap next to it.</p>';
+  if (s.calibrating) c += `<p><strong>Calibrating.</strong> Tap right next to ${esc(label(s, s.calibrating))} four or five times, spread over ten seconds or more, then press Done.</p>`;
+  c += `<p class="num">Sound: ${s.speed.toFixed(1)} m/s at ${s.config.temp_c} °C</p>`;
+  $('clocks').innerHTML = c;
+
+  let t = '<table>';
+  for (const tap of s.taps.slice(0, 12))
+    t += `<tr class="num"><td>${clock(tap.wall_us)}${tap.wall_bound_us != null ? ' ± ' + us(tap.wall_bound_us) : ''}</td><td>`
+       + (tap.x != null ? `(${tap.x.toFixed(2)}, ${tap.y.toFixed(2)}) m ± ${(tap.major_m * 100).toFixed(0)} cm${tap.line ? ' <span class="dim">along the line</span>' : ''}`
+          : tap.calibration ? `<span class="dim">calibration tap at ${esc(label(s, tap.calibration))}</span>`
+                        : `<span class="dim">${esc(tap.why)}</span>`) + '</td></tr>';
+  $('taps').innerHTML = s.taps.length ? t + '</table>' : '<p class="dim">No taps heard yet.</p>';
+
+  let b = '<table><tr><th>Board</th><th>Seen</th><th>Sweeps heard in the last minute</th><th>Beacons in 10 s</th><th></th></tr>';
+  for (const n of s.nodes) {
+    const placed = n.id in s.config.boards;
+    b += `<tr class="num"><td>${esc(n.id)}${placed ? ' · ' + esc(label(s, n.id)) : ''}</td>`
+       + `<td class="${n.live ? '' : 'bad'}">${n.age_s.toFixed(0)} s ago</td>`
+       + `<td>${n.own ? n.own + ' of its own' : '<span class="bad">none of its own</span>'}, ${n.heard} from others</td>`
+       + `<td>${n.beacons}${n.beacons_late ? ` <span class="bad">(${n.beacons_late} stamped late)</span>` : ''}</td>`
+       + `<td>${placed ? '' : `<button data-place="${esc(n.id)}">Place</button>`}`
+       + (!placed && !s.measured[n.id] ? '' : s.calibrating === n.id ? '<button data-cal="">Done</button>' : `<button data-cal="${esc(n.id)}">Calibrate here</button>`) + '</td></tr>';
+  }
+  $('boards').innerHTML = s.nodes.length ? b + '</table>' : '<p class="dim">No boards have reported yet.</p>';
+}
+
+$('boards').addEventListener('click', ev => {
+  if (ev.target.dataset.cal != null)
+    return fetch('calibrate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ at: ev.target.dataset.cal || null }) });
+  const id = ev.target.dataset.place;
+  if (!id) return;
+  let cfg;
+  try { cfg = JSON.parse($('config').value); } catch { return $('saved').textContent = 'fix the JSON first'; }
+  const m = last && last.measured[id];
+  cfg.boards[id] = { name: '', x: m ? +m.x.toFixed(3) : 0, y: m ? +m.y.toFixed(3) : 0, bias_us: 0 };
+  $('config').value = JSON.stringify(cfg, null, 2);
+  dirty = true;
+  $('saved').textContent = 'set x and y, then save';
+});
+
+$('adopt').addEventListener('click', () => {
+  let cfg;
+  try { cfg = JSON.parse($('config').value); } catch { return $('saved').textContent = 'fix the JSON first'; }
+  const measured = Object.entries(last ? last.measured : {});
+  for (const [id, m] of measured)
+    cfg.boards[id] = { name: '', bias_us: 0, ...cfg.boards[id], x: +m.x.toFixed(3), y: +m.y.toFixed(3) };
+  $('config').value = JSON.stringify(cfg, null, 2);
+  dirty = true;
+  $('saved').textContent = measured.length ? 'positions filled in; save to keep them' : 'nothing measured yet';
+});
+
+$('save').addEventListener('click', async () => {
+  let body;
+  try { body = JSON.stringify(JSON.parse($('config').value)); } catch (e) { return $('saved').textContent = 'not valid JSON: ' + e.message; }
+  const r = await fetch('config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+  if (r.ok) { dirty = false; $('saved').textContent = 'saved'; }
+  else $('saved').textContent = (await r.json()).error || 'could not save';
+});
+
+async function tick() {
+  try {
+    const s = last = await (await fetch('state')).json();
+    $('status').textContent = '';
+    if (!dirty && document.activeElement !== $('config')) $('config').value = JSON.stringify(s.config, null, 2);
+    drawMap(s);
+    drawPanels(s);
+  } catch (e) {
+    $('status').textContent = '· box unreachable';
+  }
+  setTimeout(tick, 500);
+}
+tick();
+</script>
+</html>

@@ -1,0 +1,9 @@
+dependencies:
+  idf:
+    version: ">=6.0.3"
+  wendy_core:
+    git: "https://github.com/wendylabsinc/wendy-lite.git"
+    path: "components/wendy_core"
+  wendy_net_peer:
+    git: "https://github.com/wendylabsinc/wendy-lite.git"
+    path: "components/wendy_net_peer"

@@ -1,0 +1,110 @@
+menu "Tap locator"
+
+    config TAPLOC_SAMPLE_RATE
+        int "Microphone sample rate (Hz)"
+        default 16000
+        help
+            One sample is 1/rate seconds of sound travel: 2.1 cm at 16 kHz.
+            All boards must use the same rate.
+
+    config TAPLOC_TRIGGER_RATIO
+        int "Trigger when a sample exceeds this many times the background level"
+        default 12
+        help
+            Lower hears quieter taps and more false ones.
+
+    config TAPLOC_TRIGGER_MIN
+        int "Smallest sample magnitude that can trigger (of 32768)"
+        default 200
+        help
+            Keeps a silent room, where the background level is near zero,
+            from triggering on nothing.
+
+    config TAPLOC_BUZZER_GPIO
+        int "GPIO the piezo buzzer is on (-1: none, this board only listens)"
+        default 1
+        range -1 48
+        help
+            GPIO 1 is pad D0 on the XIAO. Wire a piezo disc or a passive piezo
+            buzzer between this pin and GND. A magnetic buzzer or a speaker
+            draws more than a pin can give and needs a transistor.
+
+    config TAPLOC_SWEEP_F0
+        int "Sweep start (Hz)"
+        default 2000
+
+    config TAPLOC_SWEEP_F1
+        int "Sweep end (Hz)"
+        default 6000
+        help
+            Must stay under half the sample rate. A wider sweep times more
+            sharply; a piezo is loudest between about 2 and 5 kHz. All boards
+            must use the same sweep.
+
+    config TAPLOC_SWEEP_MS
+        int "Sweep length (ms)"
+        default 50
+        range 20 64
+        help
+            A longer sweep is heard further away: doubling it is worth about
+            40% more distance.
+
+    config TAPLOC_SWEEP_PERIOD_MS
+        int "Average time between this board's sweeps (ms)"
+        default 3000
+        range 500 60000
+        help
+            Each gap is random, 25% either side of this. More sweeps track the
+            clocks more closely; fewer are quieter and leave more silence for
+            hearing taps.
+
+    config TAPLOC_SWEEP_DETECT_DB
+        int "A sweep must stand this far above the background (dB)"
+        default 13
+        range 8 30
+        help
+            Lower hears sweeps from further away and reports more false ones,
+            which the box discards.
+
+    config TAPLOC_BEACON_MS
+        int "Time between ESP-NOW timing beacons (ms); 0 switches the radio link off"
+        default 250
+        range 0 1000
+        help
+            Boards that hear the same beacon hear it at the same instant, which
+            relates their clocks without buzzers. The same radio link carries
+            reports to a neighbour that can reach the box. It keeps the Wi-Fi
+            radio awake, which costs tens of milliamps. With 0 the boards rely
+            on sweeps or calibration taps and the radio sleeps between reports.
+            All boards must be on the same channel: see the next setting.
+
+    config TAPLOC_RADIO_CHANNEL
+        int "Channel for the ESP-NOW link (0: stay on Wi-Fi and use its channel)"
+        default 1
+        range 0 13
+        depends on TAPLOC_BEACON_MS > 0
+        help
+            With a channel set, the board leaves its Wi-Fi network and keeps
+            its radio on this channel, so every board is certain to be on the
+            same one wherever it is. Reports then reach the box through a
+            neighbouring board that is on USB or Wendy Net, and the board can
+            only be deployed to over USB. All boards must use the same channel.
+
+    config TAPLOC_REPORT_MS
+        int "Time between reports to the box (ms)"
+        default 5000
+        range 500 60000
+        help
+            The radio sleeps between reports. Taps are still sent at once.
+
+    config TAPLOC_PORT
+        int "UDP port the box listens on"
+        default 47800
+
+    config TAPLOC_BOX_HOST
+        string "Box IPv4 address (empty: find it by broadcast)"
+        default ""
+        help
+            Set this on networks that do not carry broadcast traffic.
+
+endmenu
