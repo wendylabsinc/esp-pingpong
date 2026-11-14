@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesh distances</title>
+<style>
+  :root { --bg:#f5f5f7; --panel:#fff; --line:#d1d1d6; --text:#1d1d1f; --dim:#6e6e73; --accent:#0071e3; --bad:#d70015; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1d1d1f; --panel:#2d2d2f; --line:#48484a; --text:#f5f5f7; --dim:#a1a1a6; --accent:#4aa3ff; --bad:#ff6961; }
+  }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 8px; }
+  main { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; min-width:0; }
+  #mapbox { flex:2 1 520px; }
+  aside { flex:1 1 320px; display:flex; flex-direction:column; gap:16px; min-width:0; }
+  svg { width:100%; height:auto; display:block; font:12px system-ui,sans-serif; }
+  svg text { paint-order:stroke; stroke:var(--panel); stroke-width:4px; stroke-linejoin:round; }
+  table { border-collapse:collapse; width:100%; }
+  td, th { text-align:left; padding:2px 8px 2px 0; vertical-align:top; white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; }
+  .dim { color:var(--dim); } .bad { color:var(--bad); }
+  .num { font-variant-numeric:tabular-nums; }
+  .scroll { overflow-x:auto; }
+</style>
+<h1>Mesh distances <span id="status" class="bad"></span></h1>
+<main>
+  <section id="mapbox">
+    <h2>Boards and the distances between them</h2>
+    <svg id="map" viewBox="0 0 640 480" role="img" aria-label="Boards and the measured distances between them"></svg>
+    <p class="dim">A solid line is a distance that at least three recent rounds agree on, and those lines are drawn to scale.
+      A dashed line is the best guess so far. A faded line has had no new round for 30 seconds.
+      Dotted lines join the anchor to the boards its radio hears; it measures no distance to them.
+      Sound gives distances only, so the picture may be turned or mirrored against the room.</p>
+  </section>
+  <aside>
+    <section><h2>Distances</h2><div id="edges" class="scroll"></div></section>
+    <section><h2>Boards</h2><div id="nodes" class="scroll"></div></section>
+  </aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+const short = id => id.slice(-4);
+const metres = mm => (mm / 1000).toFixed(2) + ' m';
+const pos = {};  // board -> [x, y] in metres, kept between polls so the picture does not jump
+const gap = e => Math.hypot(pos[e.b][0] - pos[e.a][0], pos[e.b][1] - pos[e.a][1]);
+
+// ponytail: springs pulling from wherever the boards were last drawn. Four or more
+// boards can settle folded over; the fit shown under the table says when. Start
+// from classical scaling (layout() in box/taploc.py) if that turns up.
+function place(s) {
+  s.nodes.forEach((n, i) => pos[n.id] ||= [0.5 * (i + 1) * Math.cos(2.4 * i), 0.5 * (i + 1) * Math.sin(2.4 * i)]);
+  for (const id in pos) if (!s.nodes.some(n => n.id === id)) delete pos[id];
+  const springs = s.edges.filter(e => e.settled);
+  for (let pass = 0; pass < 300; pass++)
+    for (const e of springs) {
+      const p = pos[e.a], q = pos[e.b], dx = q[0] - p[0], dy = q[1] - p[1], now = Math.hypot(dx, dy) || 1e-9;
+      const push = 0.25 * (now - e.mm / 1000) / now;
+      p[0] += push * dx; p[1] += push * dy; q[0] -= push * dx; q[1] -= push * dy;
+    }
+  return springs.length > 2 ? Math.sqrt(springs.reduce((sum, e) => sum + (gap(e) - e.mm / 1000) ** 2, 0) / springs.length) : null;
+}
+
+function drawMap(s) {
+  const at = Object.values(pos);
+  if (!at.length) {
+    $('map').innerHTML = `<text x="320" y="240" text-anchor="middle" fill="var(--dim)">${s.anchor ? 'The anchor hears no boards on the radio yet.' : 'Nothing from the anchor\'s dongle yet.'}</text>`;
+    return;
+  }
+  const cx = at.reduce((a, p) => a + p[0], 0) / at.length, cy = at.reduce((a, p) => a + p[1], 0) / at.length;
+  const reach = Math.max(0.25, ...at.map(p => Math.hypot(p[0] - cx, p[1] - cy))) * 1.5;
+  const k = 200 / reach, X = id => 320 + (pos[id][0] - cx) * k, Y = id => 240 - (pos[id][1] - cy) * k;
+  const bar = [10, 5, 1, 0.5, 0.1].find(m => m * k <= 200) || 0.1;
+  let h = `<path d="M16 462v6h${bar * k}v-6" fill="none" stroke="var(--dim)"/><text x="${16 + bar * k / 2}" y="458" text-anchor="middle" fill="var(--dim)">${bar} m</text>`;
+  if (s.anchor) {  // it hears the boards by radio; it has no distance to them
+    for (const n of s.nodes)
+      if (n.live) h += `<line x1="${X(n.id)}" y1="${Y(n.id)}" x2="600" y2="44" stroke="var(--dim)" stroke-dasharray="2 6" opacity=".6"/>`;
+    h += `<rect x="588" y="32" width="24" height="24" rx="4" fill="var(--dim)"><title>${esc(s.anchor.id)}, channel ${esc(s.anchor.channel)}</title></rect>`
+       + `<text x="600" y="24" text-anchor="middle" font-weight="600" fill="var(--text)">anchor ${esc(short(s.anchor.id))}</text>`;
+  }
+  for (const e of s.edges) {  // labels sit off the middle, where crossing lines would stack them
+    const text = e.mm == null ? 'no good round yet' : e.settled ? metres(e.mm) : `${metres(e.mm)}?`;
+    const why = e.mm == null ? `${e.bad} rounds skipped as implausible` : `${e.agree} of the last ${e.of} rounds agree, ${e.apart_mm} mm apart`;
+    h += `<g opacity="${e.age_s > 30 ? .35 : 1}"><title>${esc(short(e.a))} to ${esc(short(e.b))}: ${why}</title>`
+       + `<line x1="${X(e.a)}" y1="${Y(e.a)}" x2="${X(e.b)}" y2="${Y(e.b)}" stroke="var(--accent)" stroke-width="2"${e.settled ? '' : ' stroke-dasharray="6 5"'}/>`
+       + `<text x="${X(e.a) * .62 + X(e.b) * .38}" y="${Y(e.a) * .62 + Y(e.b) * .38 + 4}" text-anchor="middle" fill="var(--text)"${e.settled ? ' font-weight="600"' : ''}>${text}</text></g>`;
+  }
+  for (const n of s.nodes)
+    h += `<circle cx="${X(n.id)}" cy="${Y(n.id)}" r="8" stroke="var(--panel)" stroke-width="2" fill="${n.live ? 'var(--accent)' : 'var(--dim)'}"><title>${esc(n.id)}</title></circle>`
+       + `<text x="${X(n.id)}" y="${Y(n.id) + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(n.id))}</text>`;
+  $('map').innerHTML = h;
+}
+
+function drawPanels(s, misfit) {
+  let e = '<table><tr><th>Boards</th><th>Apart</th><th>Rounds that agree</th><th>Last round</th><th>Rounds</th></tr>';
+  for (const d of s.edges)
+    e += `<tr class="num"><td>${esc(short(d.a))} – ${esc(short(d.b))}</td>`
+       + (d.mm == null ? '<td class="dim" colspan="3">no good round yet</td>'
+          : `<td>${d.settled ? `<strong>${metres(d.mm)}</strong>` : `<span class="dim">${metres(d.mm)}?</span>`}</td>`
+          + `<td>${d.agree} of ${d.of}, ${d.apart_mm} mm apart</td>`
+          + `<td class="${d.age_s > 30 ? 'bad' : ''}">${metres(d.last_mm)}, ${d.age_s.toFixed(0)} s ago</td>`)
+       + `<td>${d.good} good, ${d.bad} skipped</td></tr>`;
+  $('edges').innerHTML = (s.edges.length ? e + '</table>' : '<p class="dim">No distances yet. A distance appears when two boards finish a round and both report it.</p>')
+    + (misfit == null ? '' : `<p class="num">The settled distances fit one flat layout to ${(misfit * 100).toFixed(1)} cm.</p>`)
+    + `<p class="num dim">Sound: ${s.speed.toFixed(1)} m/s at ${s.temp_c} °C. Buzzer to microphone: ${s.self_mm} mm.</p>`;
+
+  let b = '<table><tr><th>Board</th><th>Heard on the radio</th></tr>';
+  for (const n of s.nodes)
+    b += `<tr class="num"><td>${esc(n.id)}</td><td class="${n.live ? '' : 'bad'}">${n.age_s.toFixed(0)} s ago</td></tr>`;
+  $('nodes').innerHTML = (s.nodes.length ? b + '</table>' : '<p class="dim">No boards heard yet. Is the dongle on the boards\' channel?</p>')
+    + `<p class="num dim">${s.anchor ? `Anchor dongle ${esc(s.anchor.id)} on channel ${esc(s.anchor.channel)}.` : 'The anchor\'s dongle has not reported yet.'}</p>`;
+}
+
+async function tick() {
+  try {
+    // The Anchor's token goes after '#', which the browser keeps to itself.
+    const token = location.hash.slice(1);
+    const r = await fetch('mesh.json', token ? { headers: { Authorization: 'Bearer ' + token } } : {});
+    if (r.status === 401) $('status').textContent = '· needs the Anchor\'s token: open this page as /mesh#<token>';
+    else {
+      const s = await r.json();
+      $('status').textContent = s.demo ? '· demo: these boards are made up' : '';
+      const misfit = place(s);
+      drawMap(s);
+      drawPanels(s, misfit);
+    }
+  } catch (e) {
+    $('status').textContent = '· Anchor unreachable';
+  }
+  setTimeout(tick, 1000);
+}
+tick();
+</script>
+</html>

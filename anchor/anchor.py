@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import numpy as np
 import serial
 from clocks import Line, band
+from mesh import Mesh, PAGE as MESH_PAGE
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ANCHOR_PORT", "/dev/ttyACM0")
 OUT = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUT_DIR", "fragments")
@@ -44,6 +45,7 @@ tx_lock = threading.Lock()
 host_map = collections.deque(maxlen=200)   # (host_ns_mid, anchor_esp_us, half_rtt_ns)
 pending_ping = {}
 parts = {}                       # (src, frag) -> {idx: bytes}
+mesh = Mesh()                    # distances between the ranging boards ("R" lines)
 
 def mac(b):
     return b.hex()
@@ -236,9 +238,10 @@ def reader(s):
                 elif raw:
                     capture["f"].write(f"{time.monotonic_ns()},{raw}\n")
             if raw:
-                line_counts[raw[0] if raw[0] in "TFPAEI" else "?"] += 1
+                line_counts[raw[0] if raw[0] in "TFPAEIR" else "?"] += 1
             if raw.startswith("I,"):
                 print(raw, flush=True)
+                mesh.dongle(raw)
             handle(raw)
         except Exception as e:  # one bad line must not stop the anchor
             print(f"reader: {e!r}", flush=True)
@@ -261,6 +264,8 @@ def handle(line):
             if t0:
                 t1 = time.monotonic_ns()
                 host_map.append(((t0 + t1) // 2, int(esp), (t1 - t0) // 2))
+        elif kind == "R":
+            mesh.feed(line)
         elif kind == "F":
             _, src, b64 = line.split(",", 2)
             try:
@@ -419,6 +424,9 @@ def serve_files():
     class Handler(http.server.SimpleHTTPRequestHandler):
         """With header "Authorization: Bearer <token>":
         GET  /...                         fragments, events, captures
+        GET  /mesh.json                   ranging boards and the distances between them
+        GET  /mesh                        the page that draws them; needs no token
+                                          itself, open it as /mesh#<token>
         POST /cmd?line=<dongle command>   allowlisted, e.g. line=gpio%206
         POST /capture?seconds=<n>         raw dongle lines -> captures/<t>.csv"""
         def _authorized(self):
@@ -429,8 +437,13 @@ def serve_files():
             return False
 
         def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/mesh":  # holds no data: it fetches /mesh.json with the token after '#'
+                return self._text(open(MESH_PAGE).read(), "text/html; charset=utf-8")
             if not self._authorized():
                 return
+            if path == "/mesh.json":
+                return self._text(json.dumps(mesh.state()), "application/json")
             if self.path == "/gpiochips":
                 import gpioline
                 return self._text(json.dumps(gpioline.chips(), indent=1) + "\n")
@@ -503,9 +516,9 @@ def serve_files():
                 return self._text(f"capturing {secs:.0f} s to /captures/{os.path.basename(path)}\n")
             return self.send_error(404)
 
-        def _text(self, body):
+        def _text(self, body, kind="text/plain"):
             b = body.encode()
-            self.send_response(200); self.send_header("Content-Type", "text/plain")
+            self.send_response(200); self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
     handler = functools.partial(Handler, directory=OUT)

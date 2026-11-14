@@ -21,6 +21,8 @@
  *   T,<seq>,<esp_us_before_send>
  *   G,<pin>,<level>,<esp_us_in_isr>
  *   P,<token>,<esp_us>            reply to "ping <token>" (host clock mapping)
+ *   R,<src_mac>,<group>,<type>,<round>,<own_ns>,<heard_ns>,<with_mac>
+ *                                 a ranging frame from ../range, as it came
  * Commands (one per line): "beacon on", "beacon off", "rate <hz>",
  *   "ch <n>", "ap on", "ap off", "gpio <pin>", "drive <pin> <hz>",
  *   "ping <token>", "id".
@@ -142,13 +144,18 @@ static volatile uint32_t s_fwd_drops;
 
 #define SSB_MAGIC "SSB1"
 
-typedef enum { EV_AP, EV_ESPNOW, EV_TX, EV_GPIO } ev_kind_t;
+/* ../range/main/main.c frame_t: "PP", u8 group, u8 type, u32 round,
+ * i64 own_ns, i64 heard_ns, u8 with[6]. */
+#define PP_LEN 30
+
+typedef enum { EV_AP, EV_ESPNOW, EV_TX, EV_GPIO, EV_RANGE } ev_kind_t;
 
 typedef struct {
     ev_kind_t kind;
     int64_t arrival; /* receive stamp on esp_timer */
     uint8_t soft;
     uint8_t mac[6];
+    uint8_t with[6]; /* EV_RANGE: the other board of the round */
     uint64_t a;      /* AP TSF, beacon seq, or tx seq */
     uint32_t rx;     /* hardware receive stamp, microseconds (32-bit) */
     int64_t esp_us;  /* esp_timer at the callback / before send / in ISR */
@@ -233,6 +240,21 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
         if (xQueueSend(s_fwd, &f, 0) != pdTRUE) {
             s_fwd_drops++;
         }
+        return;
+    }
+    /* Ranging frames carry no tag: they go to USB as they are, and the Anchor
+     * treats the distances they give as unauthenticated. In ev_t: a = round,
+     * pin = group, level = type, esp_us = own_ns, arrival = heard_ns. */
+    if (len == PP_LEN && data[0] == 'P' && data[1] == 'P') {
+        ev_t e = {.kind = EV_RANGE, .pin = data[2], .level = data[3]};
+        uint32_t round;
+        memcpy(e.mac, info->src_addr, 6);
+        memcpy(&round, data + 4, 4);
+        e.a = round;
+        memcpy(&e.esp_us, data + 8, 8);
+        memcpy(&e.arrival, data + 16, 8);
+        memcpy(e.with, data + 24, 6);
+        push(&e);
         return;
     }
     if (len != SSB_LEN || memcmp(data, SSB_MAGIC, 4) != 0) {
@@ -361,7 +383,7 @@ static void print_task(void *arg)
 {
     (void)arg;
     ev_t e;
-    char mac[13];
+    char mac[13], with[13];
     for (;;) {
         if (xQueueReceive(s_q, &e, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -382,6 +404,12 @@ static void print_task(void *arg)
             break;
         case EV_GPIO:
             printf("G,%u,%u,%lld\n", e.pin, e.level, (long long)e.esp_us);
+            break;
+        case EV_RANGE:
+            hex6(mac, e.mac);
+            hex6(with, e.with);
+            printf("R,%s,%u,%u,%llu,%lld,%lld,%s\n", mac, e.pin, e.level, (unsigned long long)e.a,
+                   (long long)e.esp_us, (long long)e.arrival, with);
             break;
         }
     }
