@@ -50,6 +50,11 @@ part_count = {}                  # (src, boot, frag) -> pieces expected
 part_blen = {}                   # (src, boot, frag) -> blob length
 part_seen = {}                   # (src, boot, frag) -> monotonic time of the last piece
 SALVAGE_AFTER_S = 20             # a fragment with no new piece for this long is salvaged
+NACK_AFTER_S = 1.5               # ... and is asked for its missing pieces after this long
+NACK_TRIES = 3
+nack_state = {}                  # (src, boot, frag) -> (tries, monotonic time of the last request)
+done_keys = collections.OrderedDict()  # fragments already written; late pieces are ignored
+fseq_last = [None]               # line number of the dongle's last F line
 
 def mac(b):
     return b.hex()
@@ -223,6 +228,8 @@ completed = collections.Counter()   # src -> fragments completed
 salvaged = collections.Counter()    # src -> fragments written with zero-filled holes
 lost_fragments = collections.Counter()  # src -> fragments that could not be salvaged
 malformed = collections.Counter()   # kind -> lines that failed to parse (USB damage)
+usb_lines_lost = [0]                # F lines missing from the dongle's numbering
+nacks = collections.Counter()       # "sent", "recovered" (completed after a request)
 dongle = [None]
 dongle_lock = threading.Lock()
 capture = {"f": None, "until": 0.0, "path": None}
@@ -231,9 +238,37 @@ def send_cmd(line):
     with dongle_lock:
         dongle[0].write((line.strip() + "\n").encode())
 
+def request_missing(now):
+    """Ask nodes, through the dongle, for pieces of fragments that stopped
+    arriving with holes; salvage takes over after SALVAGE_AFTER_S."""
+    for key, t in list(part_seen.items()):
+        if now - t < NACK_AFTER_S or key not in parts:
+            continue
+        tries, last = nack_state.get(key, (0, 0.0))
+        if tries >= NACK_TRIES or now - last < 2.0:
+            continue
+        count = part_count.get(key)
+        if not count:
+            continue
+        missing = [i for i in range(count) if i not in parts[key]][:64]
+        if not missing:
+            continue
+        src, boot, frag = key
+        try:
+            send_cmd(f"nack {src} {boot:08x} {frag} {','.join(map(str, missing))}")
+        except Exception as e:
+            print(f"nack: {e!r}", flush=True)
+            return
+        nack_state[key] = (tries + 1, now)
+        nacks["sent"] += 1
+
 def reader(s):
     last = time.monotonic()
+    last_fast = last
     while True:
+        if time.monotonic() - last_fast > 0.5:
+            last_fast = time.monotonic()
+            request_missing(last_fast)
         if time.monotonic() - last > 10:
             last = time.monotonic()
             for key in [k for k, t in list(part_seen.items()) if last - t > SALVAGE_AFTER_S]:
@@ -282,6 +317,12 @@ def handle(line):
                 host_map.append(((t0 + t1) // 2, int(esp), (t1 - t0) // 2))
         elif kind == "F":
             _, src, b64 = line.split(",", 2)
+            if "," in b64:  # numbered by the dongle: F,<src>,<b64>,<n>
+                b64, n = b64.rsplit(",", 1)
+                n = int(n)
+                if fseq_last[0] is not None and n > fseq_last[0] + 1:
+                    usb_lines_lost[0] += n - fseq_last[0] - 1
+                fseq_last[0] = n
             try:
                 pkt = base64.b64decode(b64, validate=True)
             except Exception:
@@ -297,6 +338,8 @@ def handle(line):
                 return
             frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
             key = (src, boot, frag)
+            if key in done_keys:
+                return
             parts.setdefault(key, {})[idx] = pkt[SSF_HDR:-TAG_LEN]
             part_count[key] = count
             part_blen[key] = blen
@@ -310,6 +353,11 @@ def finish(key, salvage=False):
     arrived still yields its detection time and the audio around the holes."""
     src, boot, frag = key
     got = parts.pop(key)
+    done_keys[key] = True
+    while len(done_keys) > 2000:
+        done_keys.popitem(last=False)
+    if nack_state.pop(key, None) and len(got) == part_count.get(key):
+        nacks["recovered"] += 1
     count = part_count.pop(key, None) or (max(got) + 1)
     blen = part_blen.pop(key, None) or sum(len(v) for v in got.values())
     part_seen.pop(key, None)
@@ -510,7 +558,7 @@ def serve_files():
                 return self._text(json.dumps({
                     "lines": dict(line_counts), "bad_tags": bad_tags[0], "b64_errors": b64_errors[0],
                     "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed), "salvaged": dict(salvaged), "lost": dict(lost_fragments),
-                    "malformed_lines": dict(malformed), "unknown_lines": line_counts.get("?", 0),
+                    "malformed_lines": dict(malformed), "usb_lines_lost": usb_lines_lost[0], "nacks": dict(nacks), "unknown_lines": line_counts.get("?", 0),
                     "incomplete": inc, "dongle_info": last_info[0],
                     "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": usb.backlog() if hasattr(usb, "backlog") else None,
                 }, indent=1) + "\n")

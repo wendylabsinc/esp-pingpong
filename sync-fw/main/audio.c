@@ -228,6 +228,65 @@ static int anchor_fresh(void)
 #define OUTBOX 16
 typedef struct { uint8_t *blob; size_t len; uint32_t id; int tries; } outbox_t;
 
+/* Delivered fragments stay here a while so the Anchor can ask for pieces its
+ * dongle acknowledged but never passed on (SSN1, see proto.h). */
+#define RECENT 6
+static outbox_t s_recent[RECENT];
+static int s_recent_next;
+typedef struct { uint32_t frag; uint16_t n; uint16_t idx[SSN_MAX]; } nack_t;
+static QueueHandle_t s_nacks;
+
+void nack_received(const uint8_t *src, const uint8_t *data, int len)
+{
+    (void)src;
+    uint32_t boot, frag;
+    uint16_t n;
+    memcpy(&boot, data + 4, 4);
+    memcpy(&frag, data + 8, 4);
+    memcpy(&n, data + 12, 2);
+    if (!s_nacks || boot != g_boot_id || n == 0 || n > SSN_MAX || len != SSN_HDR + 2 * n + TAG_LEN ||
+        !tag_ok(data, len)) {
+        return;
+    }
+    nack_t k = {.frag = frag, .n = n};
+    memcpy(k.idx, data + SSN_HDR, 2 * n);
+    xQueueSend(s_nacks, &k, 0);
+}
+
+static void keep_recent(outbox_t *o)
+{
+    outbox_t *r = &s_recent[s_recent_next];
+    free(r->blob);
+    *r = *o;
+    s_recent_next = (s_recent_next + 1) % RECENT;
+}
+
+static int send_piece(const uint8_t *dst, const uint8_t *blob, size_t len, uint32_t frag_id, uint16_t i, uint16_t count);
+
+static void serve_nacks(outbox_t *box, int head, int n)
+{
+    nack_t k;
+    while (xQueueReceive(s_nacks, &k, 0) == pdTRUE) {
+        const outbox_t *o = NULL;
+        for (int i = 0; i < RECENT && !o; i++) {
+            if (s_recent[i].blob && s_recent[i].id == k.frag) o = &s_recent[i];
+        }
+        for (int i = 0; i < n && !o; i++) {
+            if (box[(head + i) % OUTBOX].id == k.frag) o = &box[(head + i) % OUTBOX];
+        }
+        if (!o) {
+            printf("N,%lu,asked=%u,gone\n", (unsigned long)k.frag, k.n);
+            continue;
+        }
+        uint16_t count = (o->len + SSF_CHUNK - 1) / SSF_CHUNK;
+        int ok = 0;
+        for (int i = 0; i < k.n; i++) {
+            if (k.idx[i] < count) ok += send_piece(g_anchor_mac, o->blob, o->len, o->id, k.idx[i], count);
+        }
+        printf("N,%lu,asked=%u,resent=%d\n", (unsigned long)k.frag, k.n, ok);
+    }
+}
+
 static void sender_task(void *arg)
 {
     (void)arg;
@@ -236,7 +295,8 @@ static void sender_task(void *arg)
     job_t j;
     for (;;) {
         /* take new jobs; don't block while something waits to go out */
-        while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(500)) == pdTRUE) {
+        serve_nacks(box, head, n);
+        while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(100)) == pdTRUE) {
             uint8_t *blob = NULL;
             size_t len = build_blob(&blob, j.id, j.first, j.ns, j.trig, j.hit);
             if (!blob) {
@@ -266,7 +326,11 @@ static void sender_task(void *arg)
         o->tries++;
         printf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
                (unsigned)((o->len + SSF_CHUNK - 1) / SSF_CHUNK), r, (long long)(esp_timer_get_time() - t0), o->tries, n - 1);
-        if (r == 0 || o->tries >= 20) {
+        if (r == 0) {
+            keep_recent(o);
+            head = (head + 1) % OUTBOX;
+            n--;
+        } else if (o->tries >= 20) {
             free(o->blob);
             head = (head + 1) % OUTBOX;
             n--;
@@ -532,6 +596,7 @@ void audio_start(void)
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
     s_jobs = xQueueCreate(4, sizeof(job_t));
+    s_nacks = xQueueCreate(8, sizeof(nack_t));
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 12, NULL, 1);
     xTaskCreatePinnedToCore(sender_task, "sender", 8192, NULL, 6, NULL, 0);
     xTaskCreatePinnedToCore(beep_task, "beep", 3072, NULL, 5, NULL, 0);

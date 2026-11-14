@@ -328,6 +328,38 @@ during the run. Leaving those out, each pair spans 45 to 57 us (std 13 to
 of every other for the same pair, under the 1 ms target for the error between
 nodes' detections of one sound.
 
+#### Run r7: resend requests (dongle, node and Anchor changes)
+
+- **Dongle:** every forwarded line carries a running number (`F,<src>,<b64>,<n>`),
+  output goes through one lock straight to the USB driver and blocks up to 1 s
+  instead of dropping, the I line reports `fwd_rx`, `fwd_out`, `out_drops` and
+  `nacks`, Wi-Fi receive buffers went from 10 static and 32 dynamic to 16 and 64,
+  and `ap off` also turns promiscuous receive off.
+- **Nodes:** keep their last 6 delivered fragments and answer a signed SSN1
+  request ("resend pieces i, j of fragment f", current boot id only).
+- **Anchor:** asks for the missing pieces of a fragment that has been silent for
+  1.5 s (up to 3 requests, `nack` command through the dongle), salvages after
+  20 s, and counts gaps in the dongle's line numbers.
+
+r7, 20 codes, all four boards on this firmware: every fragment completed (none
+salvaged or lost). The Anchor sent 18 requests and 8 fragments completed
+because of them. The dongle received 4,134 pieces, forwarded 4,134 lines, and
+the Anchor parsed 4,134 with no numbering gaps or damaged lines, so no piece
+was lost on USB; the pieces that went missing were acknowledged by the dongle's
+radio but never reached its receive callback. The dongle's boot id stayed the
+same through the run.
+
+| Pair | Codes in both | Std | Worst from median |
+| --- | --- | --- | --- |
+| 4e58, 4ff8 | 17 | 10 us | 21 us |
+| 4824, 4e58 | 19 | 71 us | 311 us |
+| 4824, 4ff8 | 17 | 74 us | 310 us |
+
+The 95th percentile spread in node 4824's pairs is 53 to 77 us; the worst value
+is one code. Absolute base station to node time came out 1.5 to 2 ms off on
+average with 6 of 19 codes over 5 ms, so that path is unreliable here; it is not
+the node-to-node timing above.
+
 The Anchor-clock path (each node placed by the dongle's beacon send times) did
 worse here than in the first run: std 185 to 385 us, worst 1.4 ms from the
 median. Absolute time, base station to node, came out 1.5 to 2 ms early on
