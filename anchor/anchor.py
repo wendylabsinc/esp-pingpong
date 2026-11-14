@@ -344,6 +344,9 @@ def handle(line):
                     print(f"dropped {bad_tags[0]} fragment pieces with bad tags", flush=True)
                 return
             frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
+            if frag & 0x80000000:  # node log frame, not audio
+                node_log(src, boot, frag & 0x7FFFFFFF, pkt[SSF_HDR:-TAG_LEN][:blen])
+                return
             key = (src, boot, frag)
             if key in done_keys:
                 return
@@ -353,6 +356,31 @@ def handle(line):
             part_seen[key] = time.monotonic()
             if len(parts[key]) == count:
                 finish(key)
+
+nodelog_last = {}                  # node -> (boot, last sequence)
+nodelog_gaps = collections.Counter()
+
+def node_log(src, boot, seq, data):
+    """Print a node's log lines (wendy device logs shows them) and keep them in
+    <OUT>/nodelogs/<node>.log. Sequence numbers drop duplicates (a frame the
+    node resent because its acknowledgement was lost) and expose lost frames."""
+    last = nodelog_last.get(src)
+    if last and last[0] == boot:
+        if seq <= last[1]:
+            return
+        if seq > last[1] + 1:
+            nodelog_gaps[src] += seq - last[1] - 1
+            print(f"node {src} log gap: {seq - last[1] - 1} frame(s) lost", file=sys.stderr, flush=True)
+    nodelog_last[src] = (boot, seq)
+    d = os.path.join(OUT, "nodelogs"); os.makedirs(d, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    with open(os.path.join(d, src + ".log"), "a") as f:
+        for line in data.decode(errors="replace").splitlines():
+            if not line:
+                continue
+            f.write(f"{stamp} {boot:08x} {line}\n")
+            bad = line.startswith(("W,", "L,W", "L,E", "L,\x1b[0;31mE", "L,\x1b[0;33mW"))
+            print(f"node {src} {line}", file=sys.stderr if bad else sys.stdout, flush=True)
 
 def finish(key, salvage=False):
     """Assemble a fragment from its pieces. With salvage, missing pieces are
@@ -566,7 +594,7 @@ def serve_files():
                 return self._text(json.dumps({
                     "lines": dict(line_counts), "bad_tags": bad_tags[0], "b64_errors": b64_errors[0],
                     "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed), "salvaged": dict(salvaged), "lost": dict(lost_fragments),
-                    "malformed_lines": dict(malformed), "usb_lines_lost": usb_lines_lost[0], "nacks": dict(nacks), "unknown_lines": line_counts.get("?", 0),
+                    "malformed_lines": dict(malformed), "usb_lines_lost": usb_lines_lost[0], "nacks": dict(nacks), "nodelog_gaps": dict(nodelog_gaps), "unknown_lines": line_counts.get("?", 0),
                     "incomplete": inc, "dongle_info": last_info[0],
                     "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": usb.backlog() if hasattr(usb, "backlog") else None,
                 }, indent=1) + "\n")

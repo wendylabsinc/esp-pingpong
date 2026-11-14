@@ -3,6 +3,7 @@
  * fragments sent to the Anchor over ESP-NOW.
  */
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,8 @@
 #include "driver/i2s_pdm.h"
 #include "rom/ets_sys.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_now.h"
 #include "esp_timer.h"
@@ -19,6 +22,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "proto.h"
+
+static void nlogf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 #define RATE 32000
 #define BLOCK 640                       /* 20 ms */
@@ -60,6 +65,12 @@ static int s_send_slot;              /* 0..3, from the MAC; "slot <n>" overrides
 static volatile int s_force;
 static volatile int s_enabled = 1;
 static volatile int s_print_levels;
+/* "trace on": every 5 blocks (100 ms) print what the trigger saw, to explain a
+ * missed sound afterwards:
+ *   V,<first sample>,<max dB over floor x10>,<max consecutive blocks over>,
+ *     <fire bits, one per block, oldest first>,<onset bits>,<fragments recording>,
+ *     <floor dB x10 of band 0> */
+static volatile int s_trace;
 static uint32_t s_frag_id;
 static SemaphoreHandle_t s_sent;
 typedef struct { int64_t first, trig; uint32_t ns, hit, id; } job_t;
@@ -209,10 +220,92 @@ static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
                 s_failed[still++] = s_failed[k];
             }
         }
-        printf("R,%lu,round=%d,resent=%d,still=%d\n", (unsigned long)frag_id, round + 1, nfail, still);
+        nlogf("R,%lu,round=%d,resent=%d,still=%d\n", (unsigned long)frag_id, round + 1, nfail, still);
         nfail = still;
     }
     return nfail;
+}
+
+/* Node log over the radio. Event lines (D detection, S send, N resend, R
+ * resend round, W warning, H heartbeat, B boot) and ESP_LOG output (prefixed
+ * "L,") collect in a buffer that the sender task ships to the Anchor as signed
+ * SSF1 pieces with frag_id = 0x80000000 | sequence, so the dongle forwards
+ * them unchanged and the Anchor prints them (wendy device logs). A gap in the
+ * sequence at the Anchor means log frames were lost; the node counts lines it
+ * had no room for ("logdrop" in the H line). */
+#define NLOG_SIZE 8192
+static char s_nlog[NLOG_SIZE];
+static size_t s_nlog_len;
+static portMUX_TYPE s_nlog_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_nlog_seq, s_nlog_dropped;
+static vprintf_like_t s_prev_vprintf;
+static volatile int s_trace_radio;
+
+static void nlog_append(const char *buf, size_t n)
+{
+    portENTER_CRITICAL(&s_nlog_lock);
+    if (s_nlog_len + n <= NLOG_SIZE) {
+        memcpy(s_nlog + s_nlog_len, buf, n);
+        s_nlog_len += n;
+    } else {
+        s_nlog_dropped++;
+    }
+    portEXIT_CRITICAL(&s_nlog_lock);
+}
+
+/* printf to the USB console and append to the radio log */
+static void nlogf(const char *fmt, ...)
+{
+    char buf[224];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof buf) {
+        n = sizeof buf - 1;
+        buf[n - 1] = '\n';
+    }
+    fputs(buf, stdout);
+    nlog_append(buf, n);
+}
+
+static int nlog_vprintf(const char *fmt, va_list ap)
+{
+    char buf[224];
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(buf + 2, sizeof buf - 2, fmt, ap2);
+    va_end(ap2);
+    if (n > 0) {
+        buf[0] = 'L';
+        buf[1] = ',';
+        n += 2;
+        if (n >= (int)sizeof buf) {
+            n = sizeof buf - 1;
+            buf[n - 1] = '\n';
+        }
+        nlog_append(buf, n);
+    }
+    return s_prev_vprintf ? s_prev_vprintf(fmt, ap) : vprintf(fmt, ap);
+}
+
+static const char *reset_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_USB: return "usb";
+    case ESP_RST_JTAG: return "jtag";
+    default: return "other";
+    }
 }
 
 static int anchor_fresh(void)
@@ -275,7 +368,7 @@ static void serve_nacks(outbox_t *box, int head, int n)
             if (box[(head + i) % OUTBOX].id == k.frag) o = &box[(head + i) % OUTBOX];
         }
         if (!o) {
-            printf("N,%lu,asked=%u,gone\n", (unsigned long)k.frag, k.n);
+            nlogf("N,%lu,asked=%u,gone\n", (unsigned long)k.frag, k.n);
             continue;
         }
         uint16_t count = (o->len + SSF_CHUNK - 1) / SSF_CHUNK;
@@ -283,7 +376,51 @@ static void serve_nacks(outbox_t *box, int head, int n)
         for (int i = 0; i < k.n; i++) {
             if (k.idx[i] < count) ok += send_piece(g_anchor_mac, o->blob, o->len, o->id, k.idx[i], count);
         }
-        printf("N,%lu,asked=%u,resent=%d\n", (unsigned long)k.frag, k.n, ok);
+        nlogf("N,%lu,asked=%u,resent=%d\n", (unsigned long)k.frag, k.n, ok);
+    }
+}
+
+static void ensure_peer(const uint8_t *dst)
+{
+    if (!esp_now_is_peer_exist(dst)) {
+        esp_now_peer_info_t peer = {.channel = 0, .ifidx = WIFI_IF_STA, .encrypt = false};
+        memcpy(peer.peer_addr, dst, 6);
+        esp_now_add_peer(&peer);
+    }
+}
+
+/* Ship whole log lines, up to one piece, at most every 500 ms (sooner when the
+ * buffer is filling). A frame stays queued until its piece is acknowledged. */
+static void flush_log(int outbox_n)
+{
+    static int64_t last_flush, last_beat;
+    int64_t now = esp_timer_get_time();
+    if (now - last_beat > 10000000) {
+        last_beat = now;
+        nlogf("H,up=%llds,outbox=%d,logdrop=%lu,psram_free=%u\n", (long long)(now / 1000000), outbox_n,
+              (unsigned long)s_nlog_dropped, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+    if (!anchor_fresh() || (now - last_flush < 500000 && s_nlog_len < NLOG_SIZE / 2)) return;
+    static uint8_t blob[SSF_CHUNK];
+    size_t n;
+    portENTER_CRITICAL(&s_nlog_lock);
+    n = s_nlog_len;
+    if (n > SSF_CHUNK) {
+        n = SSF_CHUNK;
+        while (n > 0 && s_nlog[n - 1] != '\n') n--;
+        if (n == 0) n = SSF_CHUNK;
+    }
+    memcpy(blob, s_nlog, n);
+    portEXIT_CRITICAL(&s_nlog_lock);
+    if (!n) return;
+    last_flush = now;
+    ensure_peer(g_anchor_mac);
+    if (send_piece(g_anchor_mac, blob, n, 0x80000000u | (s_nlog_seq & 0x7fffffffu), 0, 1)) {
+        portENTER_CRITICAL(&s_nlog_lock);
+        memmove(s_nlog, s_nlog + n, s_nlog_len - n);
+        s_nlog_len -= n;
+        portEXIT_CRITICAL(&s_nlog_lock);
+        s_nlog_seq++;
     }
 }
 
@@ -292,11 +429,11 @@ static void accept_job(outbox_t *box, int *head, int *n, const job_t *j)
     uint8_t *blob = NULL;
     size_t len = build_blob(&blob, j->id, j->first, j->ns, j->trig, j->hit);
     if (!blob) {
-        printf("W,no memory for fragment %lu\n", (unsigned long)j->id);
+        nlogf("W,no memory for fragment %lu\n", (unsigned long)j->id);
         return;
     }
     if (*n == OUTBOX) {
-        printf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[*head].id);
+        nlogf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[*head].id);
         free(box[*head].blob);
         *head = (*head + 1) % OUTBOX;
         (*n)--;
@@ -315,6 +452,7 @@ static void sender_task(void *arg)
     for (;;) {
         /* take new jobs; don't block while something waits to go out */
         serve_nacks(box, head, n);
+        flush_log(n);
         while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(100)) == pdTRUE) {
             accept_job(box, &head, &n, &j);
         }
@@ -342,7 +480,7 @@ static void sender_task(void *arg)
         int64_t t0 = esp_timer_get_time();
         int r = send_blob(o->blob, o->len, o->id);
         o->tries++;
-        printf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
+        nlogf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
                (unsigned)((o->len + SSF_CHUNK - 1) / SSF_CHUNK), r, (long long)(esp_timer_get_time() - t0), o->tries, n - 1);
         if (r == 0) {
             keep_recent(o);
@@ -376,6 +514,9 @@ static void audio_task(void *arg)
     int prev_fire = 0;
     int64_t last_trig = -(int64_t)RATE * 10;
     int64_t last_print = 0;
+    int tr_blocks = 0, tr_maxhits = 0, tr_fire = 0, tr_onset = 0;
+    float tr_maxexc = -99.0f;
+    int64_t tr_n0 = 0;
     for (;;) {
         size_t got = 0;
         if (i2s_channel_read(s_rx, blk, sizeof blk, &got, 200) != ESP_OK || got != sizeof blk) continue;
@@ -409,6 +550,9 @@ static void audio_task(void *arg)
                 bd->hits = 0;
             }
             if (bd->hits >= s_need_blocks) over |= 1u << b;
+            float exc = bd->level_db - bd->floor_db;
+            if (exc > tr_maxexc) tr_maxexc = exc;
+            if (bd->hits > tr_maxhits) tr_maxhits = bd->hits;
             /* the floor learns only from quiet blocks, so a long sound does not raise it */
             if (!npend && bd->hits == 0) bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
         }
@@ -423,15 +567,31 @@ static void audio_task(void *arg)
         }
         int onset = fire && !prev_fire;
         prev_fire = fire;
+        if (s_trace) {
+            if (tr_blocks == 0) tr_n0 = n0;
+            tr_fire |= (fire ? 1 : 0) << tr_blocks;
+            tr_onset |= (onset ? 1 : 0) << tr_blocks;
+            if (++tr_blocks == 5) {
+                if (s_trace_radio) {
+                    nlogf("V,%lld,%d,%d,%d,%d,%d,%d\n", (long long)tr_n0, (int)(tr_maxexc * 10), tr_maxhits, tr_fire,
+                       tr_onset, npend, s_nbands ? (int)(s_bands[0].floor_db * 10) : 0);
+                } else {
+                    printf("V,%lld,%d,%d,%d,%d,%d,%d\n", (long long)tr_n0, (int)(tr_maxexc * 10), tr_maxhits, tr_fire,
+                       tr_onset, npend, s_nbands ? (int)(s_bands[0].floor_db * 10) : 0);
+                }
+                tr_blocks = tr_maxhits = tr_fire = tr_onset = 0;
+                tr_maxexc = -99.0f;
+            }
+        }
         if (s_enabled && onset && n0 - last_trig >= (int64_t)RETRIGGER_MS * RATE / 1000) {
             if (npend < MAX_PENDING) {
                 pend_n[npend] = n0;
                 pend_hit[npend] = over;
                 npend++;
                 last_trig = n0;
-                printf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + npend), (long long)n0, (unsigned long)over);
+                nlogf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + npend), (long long)n0, (unsigned long)over);
             } else {
-                printf("W,trigger skipped, %d fragments already recording\n", npend);
+                nlogf("W,trigger skipped, %d fragments already recording\n", npend);
             }
         }
         /* oldest first: emit every pending fragment whose post-roll is in */
@@ -442,7 +602,7 @@ static void audio_task(void *arg)
             uint32_t ns = (uint32_t)(s_n - first);
             if (ns > RING - BLOCK * 4) ns = RING - BLOCK * 4;
             job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = pend_hit[0], .id = ++s_frag_id};
-            if (xQueueSend(s_jobs, &j, 0) != pdTRUE) printf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
+            if (xQueueSend(s_jobs, &j, 0) != pdTRUE) nlogf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
             for (int i = 1; i < npend; i++) {
                 pend_n[i - 1] = pend_n[i];
                 pend_hit[i - 1] = pend_hit[i];
@@ -586,6 +746,10 @@ int audio_command(const char *line)
     if (!strcmp(line, "mode all")) { s_mode_all = 1; return 1; }
     if (!strcmp(line, "force")) { s_force = 1; return 1; }
     if (!strcmp(line, "levels on")) { s_print_levels = 1; return 1; }
+    if (!strcmp(line, "trace on")) { s_trace = 1; return 1; }
+    if (!strcmp(line, "trace radio on")) { s_trace = 1; s_trace_radio = 1; return 1; }
+    if (!strcmp(line, "trace radio off")) { s_trace_radio = 0; return 1; }
+    if (!strcmp(line, "trace off")) { s_trace = 0; return 1; }
     if (!strcmp(line, "levels off")) { s_print_levels = 0; return 1; }
     if (!strcmp(line, "audio on")) { s_enabled = 1; return 1; }
     if (!strcmp(line, "audio off")) { s_enabled = 0; return 1; }
@@ -605,6 +769,8 @@ int audio_command(const char *line)
 
 void audio_start(void)
 {
+    s_prev_vprintf = esp_log_set_vprintf(nlog_vprintf);
+    nlogf("B,boot=%08lx,reset=%s\n", (unsigned long)g_boot_id, reset_name(esp_reset_reason()));
     s_ring = heap_caps_calloc(RING, sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_sent = xSemaphoreCreateBinary();
     esp_now_register_send_cb(send_cb);
