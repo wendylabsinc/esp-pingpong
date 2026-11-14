@@ -54,7 +54,7 @@ static band_t s_bands[MAX_BANDS];
 static int s_nbands;
 static int s_mode_all;           /* 0: any band, 1: all bands */
 static int s_need_blocks = 3;    /* consecutive blocks over threshold */
-static int s_pre_ms = 500, s_post_ms = 1500;
+static int s_pre_ms = 300, s_post_ms = 700;  /* 1 s fragments: half the airtime of 2 s */
 static int s_send_slot;              /* 0..3, from the MAC; "slot <n>" overrides */
 #define SLOT_MS 1800                 /* one fragment takes ~1.5 s to send */
 static volatile int s_force;
@@ -139,6 +139,45 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     return len;
 }
 
+/* One piece, acknowledged by the receiver's radio (ESP-NOW unicast), with up
+ * to 4 attempts. A confirmation left over from an earlier timed-out attempt is
+ * cleared first, so it cannot be mistaken for this piece's. */
+static int send_piece(const uint8_t *dst, const uint8_t *blob, size_t len, uint32_t frag_id, uint16_t i, uint16_t count)
+{
+    uint8_t pkt[SSF_HDR + SSF_CHUNK + TAG_LEN];
+    size_t off = (size_t)i * SSF_CHUNK, n = len - off < SSF_CHUNK ? len - off : SSF_CHUNK;
+    memcpy(pkt, "SSF1", 4);
+    memcpy(pkt + 4, &frag_id, 4);
+    memcpy(pkt + 8, &i, 2);
+    memcpy(pkt + 10, &count, 2);
+    uint32_t bl = len;
+    memcpy(pkt + 12, &bl, 4);
+    memcpy(pkt + 16, &g_boot_id, 4);
+    memcpy(pkt + SSF_HDR, blob + off, n);
+    if (!make_tag(pkt, SSF_HDR + n, pkt + SSF_HDR + n)) {
+        return 0;
+    }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        xSemaphoreTake(s_sent, 0);
+        if (esp_now_send(dst, pkt, SSF_HDR + n + TAG_LEN) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (xSemaphoreTake(s_sent, pdMS_TO_TICKS(200)) == pdTRUE &&
+            s_send_status == ESP_NOW_SEND_SUCCESS) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Sends every piece, then resends only the pieces that failed, for up to 4
+ * rounds. Returns -1 if the Anchor looks gone (3 failures in a row), else the
+ * number of pieces still unacknowledged (0 = delivered). A fragment is never
+ * reported delivered with holes: the caller keeps it and retries later, and
+ * the Anchor merges pieces it already has. */
+static uint16_t s_failed[(RING * 2 + BEACON_LOG * sizeof(ssm_beacon_t) + 512) / SSF_CHUNK + 8];
+
 static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
 {
     const uint8_t *dst = g_anchor_mac;
@@ -148,41 +187,32 @@ static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
         esp_now_add_peer(&peer);
     }
     uint16_t count = (len + SSF_CHUNK - 1) / SSF_CHUNK;
-    uint8_t pkt[SSF_HDR + SSF_CHUNK + TAG_LEN];
-    int failed = 0, run = 0;
-    for (uint16_t i = 0; i < count && run < 3; i++) {
-        size_t off = (size_t)i * SSF_CHUNK, n = len - off < SSF_CHUNK ? len - off : SSF_CHUNK;
-        memcpy(pkt, "SSF1", 4);
-        memcpy(pkt + 4, &frag_id, 4);
-        memcpy(pkt + 8, &i, 2);
-        memcpy(pkt + 10, &count, 2);
-        uint32_t bl = len;
-        memcpy(pkt + 12, &bl, 4);
-        memcpy(pkt + 16, &g_boot_id, 4);
-        memcpy(pkt + SSF_HDR, blob + off, n);
-        if (!make_tag(pkt, SSF_HDR + n, pkt + SSF_HDR + n)) {
-            failed++;
+    if (count > sizeof s_failed / sizeof s_failed[0]) {
+        return -1;
+    }
+    int nfail = 0, run = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        if (send_piece(dst, blob, len, frag_id, i, count)) {
+            run = 0;
             continue;
         }
-        int ok = 0;
-        for (int attempt = 0; attempt < 4 && !ok; attempt++) {
-            if (esp_now_send(dst, pkt, SSF_HDR + n + TAG_LEN) != ESP_OK) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            if (xSemaphoreTake(s_sent, pdMS_TO_TICKS(200)) == pdTRUE &&
-                s_send_status == ESP_NOW_SEND_SUCCESS) {
-                ok = 1;
-            }
-        }
-        if (!ok) {
-            failed++;
-            run++;
-        } else {
-            run = 0;
+        s_failed[nfail++] = i;
+        if (++run >= 3) {
+            return -1;
         }
     }
-    return run >= 3 ? -1 : failed;
+    for (int round = 0; round < 4 && nfail; round++) {
+        vTaskDelay(pdMS_TO_TICKS(20 * (round + 1)));
+        int still = 0;
+        for (int k = 0; k < nfail; k++) {
+            if (!send_piece(dst, blob, len, frag_id, s_failed[k], count)) {
+                s_failed[still++] = s_failed[k];
+            }
+        }
+        printf("R,%lu,round=%d,resent=%d,still=%d\n", (unsigned long)frag_id, round + 1, nfail, still);
+        nfail = still;
+    }
+    return nfail;
 }
 
 static int anchor_fresh(void)
@@ -236,7 +266,7 @@ static void sender_task(void *arg)
         o->tries++;
         printf("S,%lu,%u,%u,%d,%lld,try=%d,queued=%d\n", (unsigned long)o->id, (unsigned)o->len,
                (unsigned)((o->len + SSF_CHUNK - 1) / SSF_CHUNK), r, (long long)(esp_timer_get_time() - t0), o->tries, n - 1);
-        if (r >= 0 || o->tries >= 20) {
+        if (r == 0 || o->tries >= 20) {
             free(o->blob);
             head = (head + 1) % OUTBOX;
             n--;
@@ -476,11 +506,11 @@ void audio_start(void)
     s_ring = heap_caps_calloc(RING, sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_sent = xSemaphoreCreateBinary();
     esp_now_register_send_cb(send_cb);
-    /* Defaults that work without a laptop: the bands that reliably caught the
-     * base station's code (1.8 and 2.7 kHz, +12 dB over two 20 ms blocks). */
-    s_bands[0] = (band_t){.hz = 2700, .thr_db = 12};
-    s_bands[1] = (band_t){.hz = 1800, .thr_db = 12};
-    s_nbands = 2;
+    /* Defaults that work without a laptop: the base station's code reaches
+     * about +25 dB at 2.7 kHz (the buzzer's resonance); 1.8 kHz mostly caught
+     * room noise, and +12 dB at 2.7 kHz still did now and then. */
+    s_bands[0] = (band_t){.hz = 2700, .thr_db = 15};
+    s_nbands = 1;
     s_need_blocks = 2;
     /* Send slot from this board's MAC, so nodes that hear the same sound do
      * not all send at once: the dongle's USB link drops pieces when they do. */

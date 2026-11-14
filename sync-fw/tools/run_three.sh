@@ -29,15 +29,11 @@ for i in $(seq 1 "$N"); do
   [ "$code" = 200 ] || echo "code $i seed $seed: HTTP $code"
   sleep "$GAP"
 done
-# done when no new fragment has arrived for 30 s (at most 6 min)
-prev=-1; same=0
-for _ in $(seq 1 36); do
-  listing > "$OUT/after.txt"
-  c=$(comm -13 "$OUT/before.txt" "$OUT/after.txt" | grep -c json)
-  if [ "$c" = "$prev" ]; then same=$((same+1)); else same=0; fi
-  [ $same -ge 3 ] && break
-  prev=$c; sleep 10
-done
+# Codes are sent within seconds of being heard (send slots stagger nodes by up
+# to 5.4 s), so 30 s after the last code everything of interest is in; room
+# events that keep arriving after that are not waited for.
+sleep 30
+listing > "$OUT/after.txt"
 for n in "${NODES[@]}"; do mkdir -p "$OUT/$n"; done
 comm -13 "$OUT/before.txt" "$OUT/after.txt" | while read -r f; do curl -s -H "$H" "$B/$f" -o "$OUT/$f"; done
 curl -s -H "$H" "$B/dchirps.jsonl" | tail -n +$((L0+1)) | grep '"prn_seed": [0-9]' > "$OUT/codes.jsonl"
