@@ -11,3 +11,10 @@ firmware/.cache
 beacon/build/
 beacon/sdkconfig
 beacon/sdkconfig.old
+sync-fw/main/secret.h
+sync-fw/build*/
+sync-fw/sdkconfig
+sync-fw/sdkconfig.old
+sync-fw/managed_components/
+anchor/secret.key
+anchor/fragments/
