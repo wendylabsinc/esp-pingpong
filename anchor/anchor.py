@@ -35,9 +35,10 @@ assert len(KEY) == 32, "SOUNDSYNC_KEY must be 64 hex characters"
 TAG_LEN, SSF_HDR = 8, 20
 bad_tags = [0]
 
-def tag_ok(frame):
+def tag_ok(frame, sender_hex):
+    """Tag = HMAC-SHA256(key, frame without tag + sender's 6-byte MAC)[:8]."""
     return len(frame) > TAG_LEN and hmac.compare_digest(
-        hmac.new(KEY, frame[:-TAG_LEN], hashlib.sha256).digest()[:TAG_LEN], frame[-TAG_LEN:])
+        hmac.new(KEY, frame[:-TAG_LEN] + bytes.fromhex(sender_hex), hashlib.sha256).digest()[:TAG_LEN], frame[-TAG_LEN:])
 
 tx_seq = {}                      # beacon seq -> anchor esp_us before send
 tx_lock = threading.Lock()
@@ -267,7 +268,7 @@ def handle(line):
                 pkt = base64.b64decode(b64)
             except Exception:
                 return
-            if not tag_ok(pkt):
+            if not tag_ok(pkt, src):
                 bad_tags[0] += 1
                 if bad_tags[0] in (1, 10, 100) or bad_tags[0] % 1000 == 0:
                     print(f"dropped {bad_tags[0]} fragment pieces with bad tags", flush=True)

@@ -3,7 +3,8 @@
  * soundsync wire formats (ESP-NOW payloads), little-endian.
  *
  * Every frame ends in an 8-byte tag: HMAC-SHA256 under the shared key
- * (genkey.sh), truncated, over everything before it (scheme from esp-pingpong).
+ * (genkey.sh), truncated, over everything before it followed by the sender's
+ * 6-byte Wi-Fi MAC (so a frame replayed under another MAC fails).
  *
  * SSB1 beacon (28 B): "SSB1", u32 seq, i64 sender esp_timer before send,
  *   u32 boot id (random per boot), tag.
@@ -73,8 +74,9 @@ extern uint8_t g_anchor_mac[6];
 /* main.c: authentication */
 #include <stdbool.h>
 #include <stddef.h>
-bool make_tag(const void *data, size_t len, uint8_t out[TAG_LEN]);
-bool tag_ok(const uint8_t *frame, size_t len);
+bool make_tag(const void *data, size_t len, const uint8_t sender[6], uint8_t out[TAG_LEN]);
+bool tag_ok(const uint8_t *frame, size_t len, const uint8_t sender[6]);
+extern uint8_t s_own_mac[6];
 extern uint32_t g_boot_id;
 
 /* audio.c (targets with the XIAO PDM microphone) */

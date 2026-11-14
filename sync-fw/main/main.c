@@ -58,23 +58,30 @@ volatile int64_t g_anchor_last_us;
 uint8_t g_anchor_mac[6];
 uint32_t g_boot_id;
 static psa_key_id_t s_key;
+uint8_t s_own_mac[6];
 static volatile uint32_t s_bad_tags, s_replays;
 
-bool make_tag(const void *data, size_t len, uint8_t out[TAG_LEN])
+/* The tag covers the frame AND the sender's radio MAC, so a captured frame
+ * replayed under another MAC fails verification. */
+bool make_tag(const void *data, size_t len, const uint8_t sender[6], uint8_t out[TAG_LEN])
 {
     uint8_t mac[32];
     size_t mac_len;
-    if (psa_mac_compute(s_key, PSA_ALG_HMAC(PSA_ALG_SHA_256), data, len, mac, sizeof mac, &mac_len) != PSA_SUCCESS) {
+    psa_mac_operation_t op = PSA_MAC_OPERATION_INIT;
+    if (psa_mac_sign_setup(&op, s_key, PSA_ALG_HMAC(PSA_ALG_SHA_256)) != PSA_SUCCESS ||
+        psa_mac_update(&op, data, len) != PSA_SUCCESS || psa_mac_update(&op, sender, 6) != PSA_SUCCESS ||
+        psa_mac_sign_finish(&op, mac, sizeof mac, &mac_len) != PSA_SUCCESS) {
+        psa_mac_abort(&op);
         return false;
     }
     memcpy(out, mac, TAG_LEN);
     return true;
 }
 
-bool tag_ok(const uint8_t *frame, size_t len)
+bool tag_ok(const uint8_t *frame, size_t len, const uint8_t sender[6])
 {
     uint8_t expect[TAG_LEN], diff = 0;
-    if (len <= TAG_LEN || !make_tag(frame, len - TAG_LEN, expect)) {
+    if (len <= TAG_LEN || !make_tag(frame, len - TAG_LEN, sender, expect)) {
         return false;
     }
     for (int i = 0; i < TAG_LEN; i++) {
@@ -93,6 +100,7 @@ static void crypto_init(void)
     ESP_ERROR_CHECK(psa_crypto_init() == PSA_SUCCESS && psa_import_key(&attr, key, sizeof key, &s_key) == PSA_SUCCESS
                         ? ESP_OK : ESP_FAIL);
     g_boot_id = esp_random();
+    esp_read_mac(s_own_mac, ESP_MAC_WIFI_STA);
 }
 
 /* Replay guard, one slot per beacon source (MAC): a frame must carry a newer
@@ -238,7 +246,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     if (len != SSB_LEN || memcmp(data, SSB_MAGIC, 4) != 0) {
         return;
     }
-    if (!tag_ok(data, len)) {
+    if (!tag_ok(data, len, info->src_addr)) {
         s_bad_tags++;
         return;
     }
@@ -303,7 +311,7 @@ static void beacon_task(void *arg)
         int64_t t = esp_timer_get_time();
         memcpy(msg + 8, &t, 8);
         memcpy(msg + 16, &g_boot_id, 4);
-        if (!make_tag(msg, SSB_LEN - TAG_LEN, msg + SSB_LEN - TAG_LEN)) {
+        if (!make_tag(msg, SSB_LEN - TAG_LEN, s_own_mac, msg + SSB_LEN - TAG_LEN)) {
             continue;
         }
         ev_t e = {.kind = EV_TX, .a = seq, .esp_us = t};

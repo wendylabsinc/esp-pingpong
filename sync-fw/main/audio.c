@@ -143,7 +143,7 @@ static int send_blob(const uint8_t *blob, size_t len, uint32_t frag_id)
         memcpy(pkt + 12, &bl, 4);
         memcpy(pkt + 16, &g_boot_id, 4);
         memcpy(pkt + SSF_HDR, blob + off, n);
-        if (!make_tag(pkt, SSF_HDR + n, pkt + SSF_HDR + n)) {
+        if (!make_tag(pkt, SSF_HDR + n, s_own_mac, pkt + SSF_HDR + n)) {
             failed++;
             continue;
         }
