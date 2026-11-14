@@ -80,10 +80,11 @@ menu "Ping-pong range"
 
     config PP_SELFTEST_S
         int "Buzzer test at boot: seconds of sweeps before ranging starts (0: off)"
-        default 30
+        default 0
         range 0 120
         help
             The board plays back-to-back sweeps so the buzzer can be heard and
-            its wires checked. Ranging starts when it ends.
+            its wires checked. Ranging starts when it ends. Off by default: the
+            status line already says how many of its own sweeps a board hears.
 
 endmenu

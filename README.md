@@ -205,6 +205,9 @@ Everything travels over ESP-NOW, signed with a shared key (`sync-fw/genkey.sh`).
   HTTP. `anchor/clocks.py` reuses `Line` and the densest-band fit from
   `box/taploc.py`. On WendyOS images without `cdc_acm` it reads the dongle
   through libusb (`anchor/usbserial.py`).
+- **Mesh distances.** The dongle also passes on the frames the ranging boards
+  (`range/`) broadcast, and the Anchor draws the boards and the distances
+  between them at `/mesh`. See `anchor/README.md`.
 - **Ground truth** (`sync-fw/tools/`): `drive <pin> <hz>` on one board and
   `gpio <pin>` on another put one electrical edge on both clocks.
   `gpio_truth.py` and `anchor_truth.py` compare those stamps with what the

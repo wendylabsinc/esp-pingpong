@@ -32,6 +32,34 @@ Output: `<OUT_DIR>/<node>/<anchor_us>-f<n>.wav|json` per fragment and
 `<OUT_DIR>/events/<anchor_us>.wav|json` per event (one channel per node).
 `clocks.py` (Line, band) is adopted from esp-pingpong's `box/taploc.py`.
 
+## Mesh distances (`mesh.py`, `mesh.html`)
+
+The ranging boards (`../range`) broadcast the two timestamps of every round they
+finish. The dongle passes those frames to USB as `R` lines, `mesh.py` pairs the
+two boards' frames of a round into a distance, and keeps the distance that most
+of the last 15 rounds agree on (the rule in `range/main/agree.h`).
+
+Open `http://<device>:8091/mesh#<token>`: boards as dots, distances as lines
+drawn to scale. `GET /mesh.json` (with the token) is the same data.
+
+```bash
+python3 mesh.py              # self-check
+python3 mesh.py demo         # made-up boards on http://127.0.0.1:8092/mesh, no token
+```
+
+- The dongle needs the firmware from this commit or later (`../sync-fw`), on the
+  boards' channel (`PP_CHANNEL`, default 1, which is also the dongle's).
+- `RANGE_TEMP_C` (default 20) and `RANGE_SELF_MM` (default 40) must match the
+  boards' `PP_TEMP_C10` and `PP_SELF_MM`. Each adds straight onto every distance.
+- Ranging frames carry no tag, so anything on the channel can forge a distance.
+- **Not yet run with real boards**: checked with `mesh.py`'s self-check (the 22
+  rounds recorded at 1270 mm, then three boards) and with `anchor.py` reading
+  made-up `R` lines from a fake serial port.
+- Every board needs the `range` firmware whose frames name the other board of
+  the round (30 bytes); the two-board firmware's frames (24 bytes) are ignored.
+- The Anchor is drawn as a square joined by dotted lines to the boards its radio
+  hears. It has no buzzer or microphone in this scheme, so no distance.
+
 ## Accuracy, measured against a wire (2026-11-14)
 
 A XIAO drove a GPIO wire into the Anchor's C5; both stamped every edge.

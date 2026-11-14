@@ -1,10 +1,11 @@
-/* Ping-pong range: two Seeed XIAO ESP32S3 Sense boards, each with a piezo
- * buzzer on D0, measure the distance between them by sound. No box, no
- * network: both boards print the result on their console (`wendy run` shows it).
+/* Ping-pong range: Seeed XIAO ESP32S3 Sense boards, each with a piezo buzzer
+ * on D0, measure the distances between them by sound, two at a time. No box,
+ * no network: every board prints its distances on its console (`wendy run`
+ * shows it). An Anchor that hears the frames can gather them (../anchor/mesh.py).
  *
- * One round:
- *   1. The board with the lower MAC (the initiator) tells the other by ESP-NOW
- *      "round r starts", then plays a 50 ms sweep on its buzzer.
+ * One round, between two boards:
+ *   1. The board with the lower MAC (the initiator) says by ESP-NOW "round r
+ *      starts, with board X", then plays a 50 ms sweep on its buzzer.
  *   2. The other board (the responder) hears it and, REPLY_MS later, plays its
  *      own sweep.
  *   3. Every board timestamps, on its own microphone sample clock, its own
@@ -13,6 +14,11 @@
  *      a - b = 2 * (travel time) - (own buzzer-to-mic times), whatever the two
  *      clocks say. The boards swap (own, heard) by ESP-NOW and both work out
  *      d = c * (a - b) / 2 + self.
+ * With more than two boards, every board takes the boards with a higher MAC
+ * in turn, so each pair has one initiator. One round is on the air at a time:
+ * a board that hears any "round starts" starts none of its own until that
+ * round is over (ROUND_AIR_US) and a random while more (round_wait). If two
+ * start together all the same, the boards that notice drop their round.
  * Nothing is timed by radio; the radio only says whose turn it is and carries
  * the numbers. Unauthenticated: anyone on the channel can inject frames.
  */
@@ -50,6 +56,8 @@
 #include "wendy_net_peer.h"
 #endif
 
+#include "agree.h"
+#include "peers.h"
 #include "chirp.h"
 
 static const char *TAG = "range";
@@ -74,6 +82,7 @@ typedef struct __attribute__((packed)) {
     uint8_t group, type;
     uint32_t round;
     int64_t own_ns, heard_ns; /* F_MEAS only: on the sender's sample clock */
+    uint8_t with[6];          /* F_PING: the board that is to answer; F_MEAS: the board the round was with */
 } frame_t;
 
 typedef struct {
@@ -214,6 +223,19 @@ static void play_request(int64_t at_us, uint32_t round)
     portEXIT_CRITICAL(&s_play_lock);
 }
 
+/* Sample indexes: the detector only looks for sweeps that start in here. A
+ * detection anywhere else cannot be the other board's sweep, and it would
+ * leave the detector deaf (chirp.h's hold) when the real one arrives. */
+static int64_t s_listen_from, s_listen_to = INT64_MAX;
+
+static void listen_window(int64_t from_us, int64_t to_us)
+{
+    portENTER_CRITICAL(&s_play_lock);
+    s_listen_from = from_us * RATE / 1000000;
+    s_listen_to = to_us == INT64_MAX ? INT64_MAX : to_us * RATE / 1000000;
+    portEXIT_CRITICAL(&s_play_lock);
+}
+
 static esp_err_t buzzer_start(void)
 {
     static uint16_t half[SWEEP_HALVES];
@@ -294,6 +316,9 @@ static void chirp_task(void *arg)
         int64_t written = s_written;
         uint8_t now_epoch = s_epoch;
         portEXIT_CRITICAL(&s_mic_lock);
+        portENTER_CRITICAL(&s_play_lock);
+        int64_t listen_from = s_listen_from, listen_to = s_listen_to;
+        portEXIT_CRITICAL(&s_play_lock);
         if (base < 0 || now_epoch != epoch || written - base > HIST - 2 * BLOCK) {
             base = written;
             epoch = now_epoch;
@@ -323,6 +348,13 @@ static void chirp_task(void *arg)
             }
             if (written - base < CHIRP_N) {
                 break;
+            }
+            found = 0;
+            if (base + chirp_hop(c) <= listen_from || base >= listen_to) {
+                continue; /* nothing is expected in this block */
+            }
+            if (c->quiet_until < listen_from) {
+                c->quiet_until = listen_from; /* nor in the start of this one */
             }
             for (int n = 0; n < CHIRP_N; n++) {
                 block[n] = s_hist[(base + n) % HIST];
@@ -412,9 +444,12 @@ static void radio_start(void)
     s_radio = true;
 }
 
-static void send_frame(uint8_t type, uint32_t round, int64_t own_ns, int64_t heard_ns)
+static void send_frame(uint8_t type, uint32_t round, int64_t own_ns, int64_t heard_ns, const uint8_t *with)
 {
-    frame_t f = {{'P', 'P'}, CONFIG_PP_GROUP, type, round, own_ns, heard_ns};
+    frame_t f = {{'P', 'P'}, CONFIG_PP_GROUP, type, round, own_ns, heard_ns, {0}};
+    if (with) {
+        memcpy(f.with, with, 6);
+    }
     if (s_radio) {
         esp_now_send(EVERYONE, (const uint8_t *)&f, sizeof f);
     }
@@ -424,32 +459,67 @@ static void send_frame(uint8_t type, uint32_t round, int64_t own_ns, int64_t hea
 
 typedef struct {
     uint32_t id;
-    bool own, heard, peer, sent, done;
+    bool live, initiator, own, heard, peer, sent, done;
+    uint8_t with[6]; /* the other board of this round */
     uint8_t epoch_own, epoch_heard;
     int16_t snr_db10;
     int64_t own_ns, heard_ns, peer_own_ns, peer_heard_ns;
 } round_t;
 
 #define SLOTS 8
-#define KEEP 9 /* distances in the running median */
+#define AGREE_MM 100 /* rounds this close together count as agreeing; at 10-14 dB they came 83 mm apart */
+#define AGREE_MIN 3  /* this many must agree before the distance is called settled */
+/* A round is on the air for this long after its ping: the reply wait, then
+ * the time the initiator listens for the reply. Every board that hears a ping
+ * starts no round of its own until then (round_wait), so sweeps of two rounds
+ * do not mix. */
+#define ROUND_AIR_US (CONFIG_PP_REPLY_MS * 1000LL + 600000)
 static round_t s_rounds[SLOTS];
-static int s_dist_mm[KEEP], s_dist_n;
+static peer_t s_peers[PEERS_MAX];
 static unsigned s_good, s_bad;
-static int s_last_mm = INT32_MIN;
 
-static round_t *slot(uint32_t id)
+static round_t *round_start(uint32_t id, bool initiator, const uint8_t *with)
 {
     round_t *r = &s_rounds[id % SLOTS];
-    if (r->id != id) {
-        memset(r, 0, sizeof *r);
-        r->id = id;
-    }
+    memset(r, 0, sizeof *r);
+    r->id = id;
+    r->live = true;
+    r->initiator = initiator;
+    memcpy(r->with, with, 6);
     return r;
 }
 
-static int cmp_int(const void *a, const void *b)
+/* How long this board waits after a round's ping, its own included, before it
+ * may start one: until that round is over, then the shortest of one random
+ * draw per board it starts rounds with. A board with more pairs to range so
+ * gets the air more often, and every pair comes round about equally often
+ * (simulated: within 20% of each other for 3 to 8 boards). Two boards alone
+ * average PP_ROUND_MS between rounds. */
+static int64_t round_wait(void)
 {
-    return *(const int *)a - *(const int *)b;
+    int64_t gap = CONFIG_PP_ROUND_MS * 1000LL, spread;
+    if (gap < ROUND_AIR_US + 150000) {
+        gap = ROUND_AIR_US + 150000;
+    }
+    spread = 2 * (gap - ROUND_AIR_US);
+    if (spread > ROUND_AIR_US) {
+        spread = ROUND_AIR_US; /* wider than a round and the board with one pair loses out */
+    }
+    uint32_t least = (uint32_t)spread;
+    for (peer_t *p = s_peers; p < s_peers + PEERS_MAX; p++) {
+        if (p->used && memcmp(s_mac, p->mac, 6) < 0) {
+            uint32_t draw = esp_random() % (uint32_t)spread;
+            least = draw < least ? draw : least;
+        }
+    }
+    return gap - spread / 2 + least;
+}
+
+/* The round with this id, if this board is in it. */
+static round_t *round_find(uint32_t id)
+{
+    round_t *r = &s_rounds[id % SLOTS];
+    return r->live && r->id == id ? r : NULL;
 }
 
 static double speed_of_sound(void)
@@ -457,7 +527,7 @@ static double speed_of_sound(void)
     return 331.3 + 0.606 * CONFIG_PP_TEMP_C10 / 10.0;
 }
 
-static void try_finish(round_t *r, bool initiator)
+static void try_finish(round_t *r)
 {
     if (r->own && r->heard && !r->sent) {
         r->sent = true;
@@ -467,17 +537,17 @@ static void try_finish(round_t *r, bool initiator)
             ESP_LOGW(TAG, "round %lu: the microphone lost samples during it; skipped", (unsigned long)r->id);
             return;
         }
-        send_frame(F_MEAS, r->id, r->own_ns, r->heard_ns);
+        send_frame(F_MEAS, r->id, r->own_ns, r->heard_ns, r->with);
         vTaskDelay(pdMS_TO_TICKS(30));
-        send_frame(F_MEAS, r->id, r->own_ns, r->heard_ns); /* broadcasts are not acknowledged */
+        send_frame(F_MEAS, r->id, r->own_ns, r->heard_ns, r->with); /* broadcasts are not acknowledged */
     }
     if (!(r->own && r->heard && r->peer) || r->done) {
         return;
     }
     r->done = true;
     /* The initiator measured a = heard - own, the responder b = own - heard. */
-    int64_t a = initiator ? r->heard_ns - r->own_ns : r->peer_heard_ns - r->peer_own_ns;
-    int64_t b = initiator ? r->peer_own_ns - r->peer_heard_ns : r->own_ns - r->heard_ns;
+    int64_t a = r->initiator ? r->heard_ns - r->own_ns : r->peer_heard_ns - r->peer_own_ns;
+    int64_t b = r->initiator ? r->peer_own_ns - r->peer_heard_ns : r->own_ns - r->heard_ns;
     double d = speed_of_sound() * (a - b) * 1e-9 / 2 + CONFIG_PP_SELF_MM / 1000.0;
     if (a < 100000000 || a > 3000000000LL || b < 100000000 || b > 3000000000LL || d < 0 || d > 20) {
         s_bad++;
@@ -486,30 +556,33 @@ static void try_finish(round_t *r, bool initiator)
         return;
     }
     int mm = (int)lround(d * 1000);
-    s_dist_mm[s_good++ % KEEP] = mm;
-    s_dist_n = s_good < KEEP ? (int)s_good : KEEP;
-    int sorted[KEEP];
-    memcpy(sorted, s_dist_mm, sizeof sorted);
-    qsort(sorted, s_dist_n, sizeof sorted[0], cmp_int);
-    int median = sorted[s_dist_n / 2], spread = sorted[s_dist_n - 1] - sorted[0];
-    s_last_mm = median;
-    ESP_LOGI(TAG, "DISTANCE %d mm   (this round %d mm; median of last %d; spread %d mm; "
+    s_good++;
+    peer_t *p = peer_find(s_peers, r->with);
+    if (!p) {
+        return; /* it left while the round was on */
+    }
+    p->mm[p->good++ % AGREE_KEEP] = mm;
+    int n = p->good < AGREE_KEEP ? (int)p->good : AGREE_KEEP, agree, apart;
+    int best = agree_distance(p->mm, n, AGREE_MM, AGREE_MIN, &agree, &apart);
+    if (agree >= AGREE_MIN) {
+        p->last_mm = best;
+    }
+    ESP_LOGI(TAG, "%s to " MACSTR " %d mm   (%d of the last %d rounds agree, %d mm apart; this round %d mm; "
                   "a=%lld us b=%lld us; heard at %d.%d dB)",
-             median, mm, s_dist_n, spread, (long long)(a / 1000), (long long)(b / 1000),
-             r->snr_db10 / 10, abs(r->snr_db10 % 10));
+             agree >= AGREE_MIN ? "DISTANCE" : "not settled, best guess", MAC2STR(p->mac), best, agree, n, apart,
+             mm, (long long)(a / 1000), (long long)(b / 1000), r->snr_db10 / 10, abs(r->snr_db10 % 10));
 }
 
 static void proto_task(void *arg)
 {
     static rx_t rx;
     static ev_t ev;
-    uint8_t peer[6] = {0};
-    bool have_peer = false;
-    int64_t peer_seen = 0, next_hello = 0, next_round = BOOT_QUIET_US, next_status = 10000000,
-            next_tune = 0;
+    int64_t next_hello = 0, next_round = BOOT_QUIET_US, next_status = 10000000, next_tune = 0;
+    int64_t air_until = 0; /* the round this board is in is on the air until then */
     uint32_t round_counter = esp_random() & 0xffff0000u, cur_round = 0;
     int64_t window_from = 0, window_to = 0; /* our sample clock: the other's sweep must start in here */
     uint32_t ignored_heard = 0;
+    int turn = 0;
 
     ESP_LOGI(TAG, "board " MACSTR ", group %d, channel %d", MAC2STR(s_mac), CONFIG_PP_GROUP, CONFIG_PP_CHANNEL);
 
@@ -521,53 +594,76 @@ static void proto_task(void *arg)
                 radio_start();
             }
         }
-        bool initiator = have_peer && memcmp(s_mac, peer, 6) < 0;
 
-        if (xQueueReceive(s_rx, &rx, pdMS_TO_TICKS(10))) {
-            if (!have_peer || !memcmp(rx.src, peer, 6) || now - peer_seen > 6000000) {
-                if (!have_peer || memcmp(rx.src, peer, 6)) {
-                    memcpy(peer, rx.src, 6);
-                    have_peer = true;
-                    ESP_LOGI(TAG, "other board found: " MACSTR ", this board is the %s", MAC2STR(peer),
-                             memcmp(s_mac, peer, 6) < 0 ? "initiator" : "responder");
+        /* Every frame that is waiting, so that a ping queued behind other
+         * frames still holds this board off before it starts a round below. */
+        for (TickType_t wait = pdMS_TO_TICKS(10); xQueueReceive(s_rx, &rx, wait); wait = 0) {
+            now = esp_timer_get_time();
+            bool is_new, lower = memcmp(rx.src, s_mac, 6) < 0, for_us = !memcmp(rx.f.with, s_mac, 6);
+            peer_t *p = peer_seen(s_peers, rx.src, now, &is_new);
+            if (p && is_new) {
+                ESP_LOGI(TAG, "board found: " MACSTR ", %s (%d in contact)", MAC2STR(rx.src),
+                         lower ? "it starts the rounds with this board" : "this board starts the rounds with it",
+                         peer_count(s_peers));
+            } else if (!p && is_new && rx.f.type == F_HELLO) {
+                ESP_LOGW(TAG, "more than %d other boards: " MACSTR " is left out", PEERS_MAX, MAC2STR(rx.src));
+            }
+            bool overlap = rx.f.type == F_PING && rx.f.round != cur_round && now < air_until;
+            if (overlap) {
+                /* Two boards stopped waiting at the same moment and two rounds
+                 * are on the air: a sweep of one can be taken for the other's.
+                 * Drop the one this board is in, and do not join the new one. */
+                round_t *r = round_find(cur_round);
+                if (r) {
+                    r->live = false;
+                    s_bad++;
+                    ESP_LOGW(TAG, "round %lu: another round started during it; skipped", (unsigned long)r->id);
                 }
-                peer_seen = now;
-                initiator = memcmp(s_mac, peer, 6) < 0;
-                if (rx.f.type == F_PING && !initiator && rx.f.round != cur_round) {
-                    cur_round = rx.f.round;
-                    /* The initiator plays PING_LEAD_US after its ping. */
-                    window_from = rx.clock_us - 50000;
-                    window_to = rx.clock_us + 300000;
-                    play_request(now + CONFIG_PP_REPLY_MS * 1000LL, cur_round);
-                } else if (rx.f.type == F_MEAS) {
-                    round_t *r = slot(rx.f.round);
-                    if (!r->peer && !r->done) {
-                        r->peer = true;
-                        r->peer_own_ns = rx.f.own_ns;
-                        r->peer_heard_ns = rx.f.heard_ns;
-                        try_finish(r, initiator);
-                    }
+                play_request(0, 0);
+            }
+            if (rx.f.type == F_PING) {
+                int64_t clear = now + round_wait(); /* somebody's round, ours or not: keep off the air */
+                if (next_round < clear) {
+                    next_round = clear;
+                }
+            }
+            if (p && for_us && lower && rx.f.type == F_PING && rx.f.round != cur_round && !overlap) {
+                cur_round = rx.f.round;
+                round_start(cur_round, false, rx.src);
+                air_until = now + ROUND_AIR_US;
+                /* The initiator plays PING_LEAD_US after its ping, so its
+                 * sweep cannot get here before the ping did. */
+                window_from = rx.clock_us;
+                window_to = rx.clock_us + 300000;
+                listen_window(window_from, window_to);
+                play_request(now + CONFIG_PP_REPLY_MS * 1000LL, cur_round);
+            } else if (for_us && rx.f.type == F_MEAS) {
+                round_t *r = round_find(rx.f.round);
+                if (r && !memcmp(r->with, rx.src, 6) && !r->peer && !r->done) {
+                    r->peer = true;
+                    r->peer_own_ns = rx.f.own_ns;
+                    r->peer_heard_ns = rx.f.heard_ns;
+                    try_finish(r);
                 }
             }
         }
 
         while (xQueueReceive(s_ev, &ev, 0)) {
+            round_t *r = round_find(ev.kind == EV_OWN ? ev.round : cur_round);
             if (ev.kind == EV_OWN) {
-                round_t *r = slot(ev.round);
-                if (!r->own) {
+                if (r && !r->own) {
                     r->own = true;
                     r->own_ns = ev.t_ns;
                     r->epoch_own = ev.epoch;
-                    try_finish(r, initiator);
+                    try_finish(r);
                 }
-            } else if (cur_round && ev.t_ns / 1000 >= window_from && ev.t_ns / 1000 <= window_to) {
-                round_t *r = slot(cur_round);
+            } else if (r && ev.t_ns / 1000 >= window_from && ev.t_ns / 1000 <= window_to) {
                 if (!r->heard) {
                     r->heard = true;
                     r->heard_ns = ev.t_ns;
                     r->epoch_heard = ev.epoch;
                     r->snr_db10 = ev.snr_db10;
-                    try_finish(r, initiator);
+                    try_finish(r);
                 }
             } else {
                 ignored_heard++;
@@ -576,39 +672,56 @@ static void proto_task(void *arg)
 
         now = esp_timer_get_time();
         if (s_radio && now >= next_hello) {
-            next_hello = now + (have_peer ? 1500000 : 400000) + esp_random() % 200000;
-            send_frame(F_HELLO, 0, 0, 0);
+            next_hello = now + (peer_count(s_peers) ? 1500000 : 400000) + esp_random() % 200000;
+            send_frame(F_HELLO, 0, 0, 0, NULL);
         }
-        if (have_peer && now - peer_seen > 10000000) {
-            ESP_LOGW(TAG, "lost the other board");
-            have_peer = false;
+        for (peer_t *p = s_peers; p < s_peers + PEERS_MAX; p++) {
+            if (p->used && now - p->seen_us > 10000000) {
+                p->used = false;
+                ESP_LOGW(TAG, "lost board " MACSTR " (%d in contact)", MAC2STR(p->mac), peer_count(s_peers));
+                if (!peer_count(s_peers)) {
+                    listen_window(0, INT64_MAX); /* so the status line still says what the microphone hears */
+                }
+            }
         }
-        if (have_peer && initiator && now >= next_round) {
-            next_round = now + CONFIG_PP_ROUND_MS * 900LL + esp_random() % (CONFIG_PP_ROUND_MS * 200);
-            cur_round = ++round_counter;
-            send_frame(F_PING, cur_round, 0, 0);
-            play_request(now + PING_LEAD_US, cur_round);
-            /* The reply is played REPLY_MS after the other board gets our ping
-             * (later only if it has to wait for quiet), so only a sweep around
-             * then can be it. Anything else is an echo or a false detection. */
-            int64_t start = clock_us();
-            window_from = start + CONFIG_PP_REPLY_MS * 1000LL - 150000;
-            window_to = start + CONFIG_PP_REPLY_MS * 1000LL + 450000;
+        if (now >= next_round) {
+            next_round = now + round_wait();
+            peer_t *p = peer_next(s_peers, s_mac, &turn); /* the boards above us in turn */
+            if (p) {
+                cur_round = ++round_counter;
+                round_start(cur_round, true, p->mac);
+                air_until = now + ROUND_AIR_US;
+                send_frame(F_PING, cur_round, 0, 0, p->mac);
+                play_request(now + PING_LEAD_US, cur_round);
+                /* The reply is played REPLY_MS after the other board gets our ping
+                 * (later only if it has to wait for quiet), so it cannot get here
+                 * sooner than that. The 20 ms is for clock_us() being approximate. */
+                int64_t start = clock_us();
+                window_from = start + CONFIG_PP_REPLY_MS * 1000LL - 20000;
+                window_to = start + CONFIG_PP_REPLY_MS * 1000LL + 450000;
+                listen_window(window_from, window_to);
+            }
         }
 
         if (now >= next_status) {
             next_status = now + 10000000;
             unsigned played = atomic_exchange(&s_played, 0), own = atomic_exchange(&s_heard_own, 0),
                      other = atomic_exchange(&s_heard_other, 0);
-            if (s_last_mm == INT32_MIN) {
-                ESP_LOGI(TAG, "status: %s; %u sweeps played, %u heard back from our own buzzer, "
-                              "%u from the other board (%lu unmatched); %u good rounds, %u skipped",
-                         have_peer ? "other board in contact" : "NO other board heard on the radio", played,
-                         own, other, (unsigned long)ignored_heard, s_good, s_bad);
+            int others = peer_count(s_peers);
+            if (others) {
+                ESP_LOGI(TAG, "status: %d other board%s in contact; %u sweeps played, %u heard back from our own "
+                              "buzzer, %u from other boards (%lu unmatched); %u good rounds, %u skipped",
+                         others, others > 1 ? "s" : "", played, own, other, (unsigned long)ignored_heard, s_good,
+                         s_bad);
             } else {
-                ESP_LOGI(TAG, "status: last median %d mm; %u good rounds, %u skipped; %u sweeps played (%u heard), "
-                              "%u from the other board",
-                         s_last_mm, s_good, s_bad, played, own, other);
+                ESP_LOGI(TAG, "status: NO other board heard on the radio; %u sweeps played, %u heard back from "
+                              "our own buzzer", played, own);
+            }
+            for (peer_t *p = s_peers; p < s_peers + PEERS_MAX; p++) {
+                if (p->used && p->last_mm != INT_MIN) {
+                    ESP_LOGI(TAG, "status: " MACSTR " is %d mm away (%u good rounds)", MAC2STR(p->mac), p->last_mm,
+                             p->good);
+                }
             }
             if (played > 1 && !own) {
                 ESP_LOGW(TAG, "the microphone hears none of our own sweeps: check the buzzer on GPIO %d and GND",

@@ -1,6 +1,6 @@
 dependencies:
   esp-pqc:
-    component_hash: 157a62cf310cf0a51ca8cf3125a6dac7eec628af0b45c43c4b7c0ce11a9c2d4e
+    component_hash: aa178966259b09716c703dc759dac0ea960d303cdd947cd35afa30933dbd96c6
     dependencies:
     - name: idf
       version: '>=6.0'
@@ -38,7 +38,7 @@ dependencies:
       type: idf
     version: 6.0.3
   mbedtls:
-    component_hash: c52a1e987e288b27189b9d4237c03b48d56e56e710d9e67047cdfab8ebdf8c18
+    component_hash: 83e702283e2e56c5e74c142e181ef36df5bd4e1d2bf69d10c396eaccbf21b156
     dependencies: []
     source:
       git: https://github.com/espressif/esp-pqc.git
