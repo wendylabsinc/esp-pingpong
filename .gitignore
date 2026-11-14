@@ -22,3 +22,4 @@ range/build/
 range/sdkconfig
 range/sdkconfig.old
 range/managed_components/
+range/.cache
