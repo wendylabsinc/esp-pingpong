@@ -3,6 +3,7 @@ libusb from user space, for hosts whose kernel has no cdc_acm driver loaded.
 
 Only the CDC data interface's two bulk endpoints are used. DTR/RTS are never
 touched: on an ESP32 those lines drive reset and boot mode."""
+import collections
 import threading
 import time
 import usb.core
@@ -32,7 +33,8 @@ class UsbSerial:
         self.cv = threading.Condition()
         self.read_bytes = 0      # total bytes ever read
         self.consumed = 0        # total bytes handed out by readline
-        self.marks = []          # (read_bytes after a read, monotonic_ns of that read)
+        self.marks = collections.deque()  # (read_bytes after a read, monotonic_ns of that read)
+        self.pos = 0             # read offset into buf; compacted in large steps, not per line
         self.line_ns = 0         # arrival time of the last line readline returned
         self.max_gap_ms = 0.0
         self.max_data_gap_ms = 0.0  # longest gap between two reads that both returned data
@@ -79,12 +81,18 @@ class UsbSerial:
         deadline = time.monotonic() + self.timeout_ms / 1000
         with self.cv:
             while True:
-                nl = self.buf.find(b"\n")
+                nl = self.buf.find(b"\n", self.pos)
                 if nl >= 0:
-                    line = bytes(self.buf[:nl + 1]); del self.buf[:nl + 1]
-                    self.consumed += nl + 1
+                    line = bytes(self.buf[self.pos:nl + 1])
+                    self.consumed += nl + 1 - self.pos
+                    self.pos = nl + 1
+                    # Deleting from the front of a bytearray copies the rest, so
+                    # do it rarely; per line it turns a backlog quadratic.
+                    if self.pos > (1 << 20):
+                        del self.buf[:self.pos]
+                        self.pos = 0
                     while self.marks and self.marks[0][0] < self.consumed:
-                        self.marks.pop(0)
+                        self.marks.popleft()
                     # the read that delivered this line's newline
                     self.line_ns = self.marks[0][1] if self.marks else time.monotonic_ns()
                     return line
@@ -92,3 +100,6 @@ class UsbSerial:
                 if left <= 0:
                     return b""
                 self.cv.wait(left)
+
+    def backlog(self):
+        return len(self.buf) - self.pos

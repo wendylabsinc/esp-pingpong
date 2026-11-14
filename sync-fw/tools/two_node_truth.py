@@ -8,6 +8,9 @@ node-to-node timing of one sound, which arrival-time-difference localisation
 depends on. Nodes at different distances from the source add a constant
 (distance difference / 343 m/s); the scatter is the measured alignment.
 Also reported: the same difference via the Anchor's clock (production path).
+A located code whose correlation peak is under MIN_QUALITY times the median
+(env, default 12) is rejected as ambiguous: genuine detections in the
+three-node runs scored 19 to 59, and 7 matches at 6 to 7 were 12 to 29 ms off.
 usage: two_node_truth.py codes.jsonl dirA dirB"""
 import glob, json, os, sys, wave
 import numpy as np
@@ -54,13 +57,18 @@ def locate(c, frags):
         return m, m["first_sample_node_esp_us"] + k * us, t0 + k * us, q
     return None
 
+MIN_QUALITY = float(os.environ.get("MIN_QUALITY", "12"))
 A, B = load(sys.argv[2]), load(sys.argv[3])
 rows = []
+rejected = 0
 for c in codes:
     la, lb = locate(c, A), locate(c, B)
     if not la or not lb:
         continue
     (ma, ta, aa, qa), (mb, tb, ab, qb) = la, lb
+    if min(qa, qb) < MIN_QUALITY:
+        rejected += 1
+        continue
     arr_a = {b[1]: b[3] for b in ma["beacons"] if not b[4]}
     arr_b = {b[1]: b[3] for b in mb["beacons"] if not b[4]}
     pairs = [(arr_b[s], arr_a[s]) for s in arr_b if s in arr_a]
@@ -70,7 +78,7 @@ for c in codes:
     tb_in_a, sig = line(tb)
     rows.append(dict(seed=c["prn_seed"], rbs=tb_in_a - ta, sig=sig, anchor=ab - aa, qa=qa, qb=qb, n=len(pairs)))
 
-print(f"codes {len(codes)}, located in both nodes: {len(rows)}")
+print(f"codes {len(codes)}, located in both nodes: {len(rows)}, rejected as ambiguous (quality < {MIN_QUALITY:g}): {rejected}")
 for r in rows:
     print(f"  seed {r['seed']:#06x}: B - A via shared beacons {r['rbs']:+8.1f} us (fit ±{r['sig']:.1f}, {r['n']} beacons)   via Anchor clock {r['anchor']:+8.0f} us   quality {r['qa']:.0f}/{r['qb']:.0f}")
 for key, name in (("rbs", "via shared beacons (node-to-node path)"), ("anchor", "via the Anchor clock (production path)")):

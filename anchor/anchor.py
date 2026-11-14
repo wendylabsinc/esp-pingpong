@@ -33,6 +33,7 @@ _key_text = os.environ.get("SOUNDSYNC_KEY") or open(os.path.join(os.path.dirname
 KEY = bytes.fromhex(_key_text.strip())
 assert len(KEY) == 32, "SOUNDSYNC_KEY must be 64 hex characters"
 TAG_LEN, SSF_HDR = 8, 20
+SSF_CHUNK = 1400                 # data bytes per piece (sync-fw proto.h)
 bad_tags = [0]
 b64_errors = [0]                  # F lines that are not valid base64 (truncated on USB)
 
@@ -46,6 +47,9 @@ host_map = collections.deque(maxlen=200)   # (host_ns_mid, anchor_esp_us, half_r
 pending_ping = {}
 parts = {}                       # (src, frag) -> {idx: bytes}
 part_count = {}                  # (src, boot, frag) -> pieces expected
+part_blen = {}                   # (src, boot, frag) -> blob length
+part_seen = {}                   # (src, boot, frag) -> monotonic time of the last piece
+SALVAGE_AFTER_S = 20             # a fragment with no new piece for this long is salvaged
 
 def mac(b):
     return b.hex()
@@ -216,6 +220,9 @@ def write_event(ev):
 line_counts = collections.Counter()
 last_info = [""]
 completed = collections.Counter()   # src -> fragments completed
+salvaged = collections.Counter()    # src -> fragments written with zero-filled holes
+lost_fragments = collections.Counter()  # src -> fragments that could not be salvaged
+malformed = collections.Counter()   # kind -> lines that failed to parse (USB damage)
 dongle = [None]
 dongle_lock = threading.Lock()
 capture = {"f": None, "until": 0.0, "path": None}
@@ -229,11 +236,14 @@ def reader(s):
     while True:
         if time.monotonic() - last > 10:
             last = time.monotonic()
+            for key in [k for k, t in list(part_seen.items()) if last - t > SALVAGE_AFTER_S]:
+                finish(key, salvage=True)
             pending_pieces = sum(len(v) for v in parts.values())
             gap = s.take_max_gap_ms() if hasattr(s, "take_max_gap_ms") else -1
-            backlog = len(s.buf) if hasattr(s, "buf") else -1
+            backlog = s.backlog() if hasattr(s, "backlog") else -1
             print(f"stats: lines {dict(line_counts)}, bad tags {bad_tags[0]}, pieces waiting {pending_pieces} in {len(parts)} fragments, "
                   f"usb max read gap {gap:.0f} ms, backlog {backlog} B", flush=True)
+        raw = ""
         try:
             raw = s.readline().decode(errors="replace").strip()
             if capture["f"]:
@@ -249,6 +259,7 @@ def reader(s):
                 print(raw, flush=True)
             handle(raw)
         except Exception as e:  # one bad line must not stop the anchor
+            malformed[raw[:1] if raw else "?"] += 1
             print(f"reader: {e!r}", flush=True)
 
 def handle(line):
@@ -288,26 +299,69 @@ def handle(line):
             key = (src, boot, frag)
             parts.setdefault(key, {})[idx] = pkt[SSF_HDR:-TAG_LEN]
             part_count[key] = count
+            part_blen[key] = blen
+            part_seen[key] = time.monotonic()
             if len(parts[key]) == count:
-                got = parts.pop(key)
-                part_count.pop(key, None)
-                completed[src] += 1
-                blob = b"".join(got[i] for i in range(count))[:blen]
-                try:
-                    meta, pcm = parse_blob(blob)
-                    placed, why = place(meta)
-                    stem = write(meta, pcm, placed)
-                    if placed:
-                        add_to_event(meta, pcm, placed)
-                    peak = int(np.abs(pcm.astype(np.int32)).max()) if len(pcm) else 0
-                    if placed:
-                        print(f"fragment {src} #{frag}: {meta['n_samples']/meta['rate']:.2f} s, bands_hit={meta['bands_hit']:#x}, "
-                              f"first sample at anchor {placed['first_sample_anchor_us']/1e6:.6f} s, node {placed['node_rate_hz_fitted']:.3f} Hz (fit), "
-                              f"{(placed['node_vs_anchor_ppm'] or 0):+.1f} ppm, ±{placed['anchor_sigma_us']:.0f} us, {placed['beacons_matched']} beacons, peak {peak} -> {stem}.wav", flush=True)
-                    else:
-                        print(f"fragment {src} #{frag}: not placed ({why}) -> {stem}.wav", flush=True)
-                except Exception as e:
-                    print(f"fragment {src} #{frag}: parse error {e}", flush=True)
+                finish(key)
+
+def finish(key, salvage=False):
+    """Assemble a fragment from its pieces. With salvage, missing pieces are
+    zero-filled: a fragment whose header pieces (meta, block stamps, beacons)
+    arrived still yields its detection time and the audio around the holes."""
+    src, boot, frag = key
+    got = parts.pop(key)
+    count = part_count.pop(key, None) or (max(got) + 1)
+    blen = part_blen.pop(key, None) or sum(len(v) for v in got.values())
+    part_seen.pop(key, None)
+    missing = [i for i in range(count) if i not in got]
+    if missing and not salvage:
+        return
+    blob = bytearray()
+    for i in range(count):
+        n = min(SSF_CHUNK, blen - i * SSF_CHUNK)
+        blob += got.get(i, bytes(n))[:n]
+    blob = bytes(blob)
+    try:
+        meta, pcm = parse_blob(blob)
+    except Exception as e:
+        lost_fragments[src] += 1
+        print(f"fragment {src} #{frag}: parse error {e}" + (f" (salvage, missing {missing})" if missing else ""), flush=True)
+        return
+    if missing:
+        # header end = start of PCM; a missing piece before it corrupts the meta
+        hdr_end = blob_header_len(meta)
+        if any(i * SSF_CHUNK < hdr_end for i in missing):
+            lost_fragments[src] += 1
+            print(f"fragment {src} #{frag}: lost, header pieces missing {missing}", flush=True)
+            return
+        holes = []
+        for i in missing:
+            a = max(0, (i * SSF_CHUNK - hdr_end) // 2)
+            b = min(meta["n_samples"], ((i + 1) * SSF_CHUNK - hdr_end + 1) // 2)
+            holes.append([int(a), int(b)])
+        meta["partial"] = True
+        meta["missing_pieces"] = missing
+        meta["missing_sample_ranges"] = holes
+        salvaged[src] += 1
+    else:
+        completed[src] += 1
+    try:
+        placed, why = place(meta)
+        stem = write(meta, pcm, placed)
+        if placed:
+            add_to_event(meta, pcm, placed)
+    except Exception as e:
+        print(f"fragment {src} #{frag}: place/write error {e!r}", flush=True)
+        return
+    tag = f" PARTIAL, {len(missing)} of {count} pieces zero-filled" if missing else ""
+    if placed:
+        print(f"fragment {src} #{frag}{tag}: {meta['n_samples']/meta['rate']:.2f} s, bands_hit={meta['bands_hit']:#x}, "
+              f"first sample at anchor {placed['first_sample_anchor_us']/1e6:.6f} s, {placed['beacons_matched']} beacons -> {stem}.wav", flush=True)
+    else:
+        print(f"fragment {src} #{frag}{tag}: not placed ({why}) -> {stem}.wav", flush=True)
+
+def blob_header_len(meta):
+    return struct.calcsize("<4s6sHIIqIqIHH") + 16 * len(meta["bands"]) + 16 * len(meta["stamps"]) + 24 * len(meta["beacons"])
 
 def ping_map(host_ns):
     """Base-station monotonic ns -> dongle esp_timer us, from the tightest
@@ -455,9 +509,10 @@ def serve_files():
                 usb = dongle[0]
                 return self._text(json.dumps({
                     "lines": dict(line_counts), "bad_tags": bad_tags[0], "b64_errors": b64_errors[0],
-                    "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed),
+                    "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed), "salvaged": dict(salvaged), "lost": dict(lost_fragments),
+                    "malformed_lines": dict(malformed), "unknown_lines": line_counts.get("?", 0),
                     "incomplete": inc, "dongle_info": last_info[0],
-                    "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": len(getattr(usb, "buf", b"")),
+                    "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": usb.backlog() if hasattr(usb, "backlog") else None,
                 }, indent=1) + "\n")
             if self.path == "/gpiochips":
                 import gpioline
