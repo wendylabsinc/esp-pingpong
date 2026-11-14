@@ -88,6 +88,7 @@ def parse_blob(blob):
                 bands_hit=hit, bands=bands, stamps=stamps, beacons=beacons), pcm
 
 beacon_hist = collections.defaultdict(dict)   # node -> {seq: arrival esp_us}
+node_boot = {}                                 # node -> boot id its beacon_hist belongs to
 ref_node = [None]
 
 def tx_pairs(arrivals):
@@ -109,6 +110,12 @@ def place(meta):
     a = resid.min()
     n2esp = lambda q: a + b_us_per_sample * q
     node = meta["node"]
+    # A node's esp_timer restarts at boot: arrival times from an earlier boot
+    # must not be fitted together with this boot's.
+    boot = meta.get("boot")
+    if boot is not None and node_boot.get(node) != boot:
+        beacon_hist[node].clear()
+        node_boot[node] = boot
     for src, seq, rx, arr, soft in meta["beacons"]:
         if not soft:
             beacon_hist[node][seq] = arr
@@ -371,6 +378,7 @@ def finish(key, salvage=False):
     blob = bytes(blob)
     try:
         meta, pcm = parse_blob(blob)
+        meta["boot"] = boot
     except Exception as e:
         lost_fragments[src] += 1
         print(f"fragment {src} #{frag}: parse error {e}" + (f" (salvage, missing {missing})" if missing else ""), flush=True)

@@ -56,7 +56,7 @@ static int s_mode_all;           /* 0: any band, 1: all bands */
 static int s_need_blocks = 3;    /* consecutive blocks over threshold */
 static int s_pre_ms = 300, s_post_ms = 700;  /* 1 s fragments: half the airtime of 2 s */
 static int s_send_slot;              /* 0..3, from the MAC; "slot <n>" overrides */
-#define SLOT_MS 1800                 /* one fragment takes ~1.5 s to send */
+#define SLOT_MS 400                  /* stagger of fresh fragments between nodes; resend requests repair collisions */
 static volatile int s_force;
 static volatile int s_enabled = 1;
 static volatile int s_print_levels;
@@ -226,7 +226,7 @@ static int anchor_fresh(void)
  * the Anchor merges pieces it already has. Delivery is asynchronous by design:
  * every sample carries its own timestamps. */
 #define OUTBOX 16
-typedef struct { uint8_t *blob; size_t len; uint32_t id; int tries; } outbox_t;
+typedef struct { uint8_t *blob; size_t len; uint32_t id; int tries; int64_t ready_us; } outbox_t;
 
 /* Delivered fragments stay here a while so the Anchor can ask for pieces its
  * dongle acknowledged but never passed on (SSN1, see proto.h). */
@@ -287,40 +287,58 @@ static void serve_nacks(outbox_t *box, int head, int n)
     }
 }
 
+static void accept_job(outbox_t *box, int *head, int *n, const job_t *j)
+{
+    uint8_t *blob = NULL;
+    size_t len = build_blob(&blob, j->id, j->first, j->ns, j->trig, j->hit);
+    if (!blob) {
+        printf("W,no memory for fragment %lu\n", (unsigned long)j->id);
+        return;
+    }
+    if (*n == OUTBOX) {
+        printf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[*head].id);
+        free(box[*head].blob);
+        *head = (*head + 1) % OUTBOX;
+        (*n)--;
+    }
+    box[(*head + *n) % OUTBOX] = (outbox_t){blob, len, j->id, 0, esp_timer_get_time()};
+    (*n)++;
+}
+
 static void sender_task(void *arg)
 {
     (void)arg;
     static outbox_t box[OUTBOX];
     int head = 0, n = 0;
     job_t j;
+    uint32_t slot_waited = 0;
     for (;;) {
         /* take new jobs; don't block while something waits to go out */
         serve_nacks(box, head, n);
         while (xQueueReceive(s_jobs, &j, n ? 0 : pdMS_TO_TICKS(100)) == pdTRUE) {
-            uint8_t *blob = NULL;
-            size_t len = build_blob(&blob, j.id, j.first, j.ns, j.trig, j.hit);
-            if (!blob) {
-                printf("W,no memory for fragment %lu\n", (unsigned long)j.id);
-                continue;
-            }
-            if (n == OUTBOX) {
-                printf("W,outbox full, dropped fragment %lu\n", (unsigned long)box[head].id);
-                free(box[head].blob);
-                head = (head + 1) % OUTBOX;
-                n--;
-            }
-            box[(head + n) % OUTBOX] = (outbox_t){blob, len, j.id, 0};
-            n++;
+            accept_job(box, &head, &n, &j);
         }
         if (!n) continue;
         if (!anchor_fresh()) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
-        outbox_t *o = &box[head];
-        if (o->tries == 0 && s_send_slot > 0) {
-            vTaskDelay(pdMS_TO_TICKS(s_send_slot * SLOT_MS));
+        int64_t until = box[head].ready_us + (int64_t)s_send_slot * SLOT_MS * 1000;
+        if (box[head].tries == 0 && s_send_slot > 0 && slot_waited != box[head].id && esp_timer_get_time() < until) {
+            /* A fresh fragment waits for this node's slot after it finished
+             * recording, so nodes that heard the same sound do not all start
+             * at once; a fragment that has already waited in the outbox goes
+             * immediately. Finished recordings keep being copied out of the
+             * 4 s audio ring meanwhile. */
+            slot_waited = box[head].id;
+            for (int64_t left; (left = until - esp_timer_get_time()) > 0;) {
+                if (xQueueReceive(s_jobs, &j, pdMS_TO_TICKS(left / 1000 + 1)) == pdTRUE) {
+                    accept_job(box, &head, &n, &j);
+                }
+            }
+            continue; /* the head may have changed if the outbox overflowed */
         }
+        outbox_t *o = &box[head];
         int64_t t0 = esp_timer_get_time();
         int r = send_blob(o->blob, o->len, o->id);
         o->tries++;
@@ -346,9 +364,17 @@ static void audio_task(void *arg)
     int16_t blk[BLOCK];
     int stamp_i = 0;
     uint32_t read_blocks = 0;
-    int pending = 0;          /* a trigger is waiting for its post-roll */
-    int64_t trig_n = 0, holdoff_until = 0;
-    uint32_t trig_hit = 0;
+    /* Triggers waiting for their post-roll. Each new onset (the bands going
+     * from quiet to over threshold) at least RETRIGGER_MS after the previous
+     * one gets its own fragment, even while an earlier fragment is still
+     * recording, so a sound right after another one is not missed. */
+#define MAX_PENDING 3
+#define RETRIGGER_MS 250
+    int npend = 0;
+    int64_t pend_n[MAX_PENDING];
+    uint32_t pend_hit[MAX_PENDING];
+    int prev_fire = 0;
+    int64_t last_trig = -(int64_t)RATE * 10;
     int64_t last_print = 0;
     for (;;) {
         size_t got = 0;
@@ -384,7 +410,7 @@ static void audio_task(void *arg)
             }
             if (bd->hits >= s_need_blocks) over |= 1u << b;
             /* the floor learns only from quiet blocks, so a long sound does not raise it */
-            if (!pending && bd->hits == 0) bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
+            if (!npend && bd->hits == 0) bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
         }
         uint32_t all = s_nbands >= 32 ? 0xffffffffu : ((1u << s_nbands) - 1);
         int fire = s_nbands && (s_mode_all ? over == all : over != 0);
@@ -395,21 +421,33 @@ static void audio_task(void *arg)
             for (int b = 0; b < s_nbands; b++) printf(",%.0f:%.1f/%.1f", s_bands[b].hz, s_bands[b].level_db, s_bands[b].floor_db);
             printf("\n");
         }
-        if (s_enabled && fire && !pending && n0 >= holdoff_until) {
-            pending = 1;
-            trig_n = n0;
-            trig_hit = over;
-            printf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + 1), (long long)trig_n, (unsigned long)over);
+        int onset = fire && !prev_fire;
+        prev_fire = fire;
+        if (s_enabled && onset && n0 - last_trig >= (int64_t)RETRIGGER_MS * RATE / 1000) {
+            if (npend < MAX_PENDING) {
+                pend_n[npend] = n0;
+                pend_hit[npend] = over;
+                npend++;
+                last_trig = n0;
+                printf("D,%lu,%lld,%lu\n", (unsigned long)(s_frag_id + npend), (long long)n0, (unsigned long)over);
+            } else {
+                printf("W,trigger skipped, %d fragments already recording\n", npend);
+            }
         }
-        if (pending && s_n >= trig_n + (int64_t)s_post_ms * RATE / 1000) {
-            pending = 0;
+        /* oldest first: emit every pending fragment whose post-roll is in */
+        while (npend && s_n >= pend_n[0] + (int64_t)s_post_ms * RATE / 1000) {
+            int64_t trig_n = pend_n[0];
             int64_t first = trig_n - (int64_t)s_pre_ms * RATE / 1000;
             if (first < 0) first = 0;
             uint32_t ns = (uint32_t)(s_n - first);
             if (ns > RING - BLOCK * 4) ns = RING - BLOCK * 4;
-            job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = trig_hit, .id = ++s_frag_id};
+            job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = pend_hit[0], .id = ++s_frag_id};
             if (xQueueSend(s_jobs, &j, 0) != pdTRUE) printf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
-            holdoff_until = s_n + RATE / 2;
+            for (int i = 1; i < npend; i++) {
+                pend_n[i - 1] = pend_n[i];
+                pend_hit[i - 1] = pend_hit[i];
+            }
+            npend--;
         }
     }
 }
@@ -572,10 +610,12 @@ void audio_start(void)
     esp_now_register_send_cb(send_cb);
     /* Defaults that work without a laptop: the base station's code reaches
      * about +25 dB at 2.7 kHz (the buzzer's resonance); 1.8 kHz mostly caught
-     * room noise, and +12 dB at 2.7 kHz still did now and then. */
+     * room noise. +12 dB doubled room triggers and swamped the radio; +15 dB
+     * held over three 20 ms blocks keeps the 235 ms code and drops short room
+     * sounds (clicks, syllables). */
     s_bands[0] = (band_t){.hz = 2700, .thr_db = 15};
     s_nbands = 1;
-    s_need_blocks = 2;
+    s_need_blocks = 3;
     /* Send slot from this board's MAC, so nodes that hear the same sound do
      * not all send at once: the dongle's USB link drops pieces when they do. */
     uint8_t mac[6];
@@ -595,7 +635,7 @@ void audio_start(void)
     i2s_event_callbacks_t cbs = {.on_recv = on_dma_recv};
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
-    s_jobs = xQueueCreate(4, sizeof(job_t));
+    s_jobs = xQueueCreate(8, sizeof(job_t));
     s_nacks = xQueueCreate(8, sizeof(nack_t));
     xTaskCreatePinnedToCore(audio_task, "audio", 8192, NULL, 12, NULL, 1);
     xTaskCreatePinnedToCore(sender_task, "sender", 8192, NULL, 6, NULL, 0);

@@ -76,6 +76,28 @@ try:
     say("stats:", json.dumps(st))
 except Exception as e:
     say("stats:", repr(e))
+# Detection per node: a fragment triggered by the code itself (trigger within
+# -50..+300 ms of the code start), the code only inside a fragment triggered by
+# something else, or no fragment at all. This is the "did every node catch
+# every sound" count, independent of the timing analysis below.
+code_list = [json.loads(l) for l in codes]
+for n in nodes:
+    metas = []
+    for f in now[n] - before[n]:
+        m = json.load(open(os.path.join(out, n, f)))
+        if "trigger_anchor_us" in m:
+            metas.append(m)
+    got, inside, none = 0, [], []
+    for i, c in enumerate(code_list, 1):
+        t = c["dongle_esp_us"]
+        if any(-50e3 < m["trigger_anchor_us"] - t < 300e3 for m in metas):
+            got += 1
+        elif any(0 < t - m["first_sample_anchor_us"] < m["n_samples"] / m["rate"] * 1e6 for m in metas):
+            inside.append(i)
+        else:
+            none.append(i)
+    say(f"DETECTED {n}: {got}/{len(code_list)}" + (f", only inside another fragment: {inside}" if inside else "")
+        + (f", no fragment: {none}" if none else ""))
 env = dict(os.environ, PYTHONPATH="/app:" + here)
 codes_path = os.path.join(run, "codes.jsonl")
 active = [n for n in nodes if now[n] - before[n]]
