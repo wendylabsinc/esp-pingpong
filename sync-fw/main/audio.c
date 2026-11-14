@@ -553,8 +553,24 @@ static void audio_task(void *arg)
             float exc = bd->level_db - bd->floor_db;
             if (exc > tr_maxexc) tr_maxexc = exc;
             if (bd->hits > tr_maxhits) tr_maxhits = bd->hits;
-            /* the floor learns only from quiet blocks, so a long sound does not raise it */
-            if (!npend && bd->hits == 0) bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
+            /* The floor learns only from quiet blocks: no fragment recording, the
+             * smoothed level not over threshold, and the raw block power itself
+             * under threshold. Without the last test the first block of every
+             * sound (raw power high, smoothed level not yet over) was learned,
+             * and sounds 2 s apart ratcheted the floor up until they no longer
+             * triggered (measured: -4.5 dB to +13.8 dB over 20 beeps).
+             * A faster fall (0.4 s) for every quieter block was tried: the floor
+             * then tracked the gaps in room noise and room sounds triggered 2.5
+             * times as often.
+             * But a floor more than 10 dB above the current block (a loud first
+             * block after boot started it at +22.8 dB and it took 40 s to
+             * settle) falls at 0.05 per block, about 0.4 s. */
+            int quiet_block = 10.0f * log10f(pw) < bd->floor_db + bd->thr_db;
+            if (pw < 0.1f * bd->floor_p) {
+                bd->floor_p += 0.05f * (pw - bd->floor_p);
+            } else if (!npend && bd->hits == 0 && quiet_block) {
+                bd->floor_p += FLOOR_ALPHA * (pw - bd->floor_p);
+            }
         }
         uint32_t all = s_nbands >= 32 ? 0xffffffffu : ((1u << s_nbands) - 1);
         int fire = s_nbands && (s_mode_all ? over == all : over != 0);

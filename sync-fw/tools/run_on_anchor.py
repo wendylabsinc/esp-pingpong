@@ -10,6 +10,9 @@ directly, then runs e2e_truth.py per node and two_node_truth.py per pair.
 After the last code it waits only until every detection the nodes logged
 over the radio during the run (D lines in <OUT_DIR>/nodelogs) has arrived as
 a fragment: at least 1.5 s (node logs ship every 0.5 s), at most 10 s.
+It ends with the per-code ledger (ledger.py) built from this run's node logs,
+and prints everything to stdout too, so one exec call can run it in the
+foreground and read the result.
 usage: run_on_anchor.py <name> <n_codes> <spacing_s> [distance_cm] [--timing]
   --timing also runs e2e_truth.py per node and two_node_truth.py per pair"""
 import hashlib, hmac, itertools, json, os, random, subprocess, sys, time, urllib.request
@@ -29,6 +32,7 @@ log = open(os.path.join(out, "runs", name + ".log"), "w", buffering=1)
 
 def say(*a):
     print(*a, file=log, flush=True)
+    print(*a, flush=True)
 
 def http(method, path):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method,
@@ -57,6 +61,7 @@ dchirps = os.path.join(out, "dchirps.jsonl")
 l0 = sum(1 for _ in open(dchirps)) if os.path.exists(dchirps) else 0
 say(f"run {name}: {n_codes} codes, {gap} s apart, nodes {nodes}")
 for i in range(n_codes):
+    t_code = time.time()
     seed = random.randrange(0x0300, 0xFF00)
     try:
         st, _ = http("POST", f"/dchirp?prn={seed:#06x}")
@@ -64,7 +69,8 @@ for i in range(n_codes):
         st = repr(e)
     if st != 200:
         say(f"code {i + 1} seed {seed:#06x}: {st}")
-    time.sleep(gap)
+    if i < n_codes - 1:  # spacing measured from the start of each code
+        time.sleep(max(0.0, gap - (time.time() - t_code)))
 
 def expected():
     """(node, frag id) of every detection logged since the run started"""
@@ -150,6 +156,21 @@ for n in nodes:
     say(f"DETECTED {n}: {got}/{len(code_list)}" + (f", only inside another fragment: {inside}" if inside else "")
         + (f", no fragment: {none}" if none else ""))
 env = dict(os.environ, PYTHONPATH="/app:" + here)
+# Per-code ledger from this run's part of the node logs (sent over the radio).
+caps = []
+for f, size in log_sizes().items():
+    node = f[:-4]
+    if node not in nodes:
+        continue
+    dst = os.path.join(run, node + ".nodelog")
+    with open(os.path.join(logdir, f), errors="replace") as fh, open(dst, "w") as o:
+        fh.seek(log_start.get(f, 0))
+        o.write(fh.read())
+    caps.append(f"{node}={dst}")
+if caps and os.path.exists(os.path.join(here, "ledger.py")):
+    r = subprocess.run([sys.executable, os.path.join(here, "ledger.py"), run] + caps, capture_output=True, text=True, env=env)
+    say((r.stdout + r.stderr).rstrip())
+say(f"total {time.time() - t_start:.0f} s")
 if not timing:
     say("done")
     sys.exit(0)
