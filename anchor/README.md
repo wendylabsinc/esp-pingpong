@@ -13,6 +13,10 @@ python anchor.py /dev/cu.usbmodem101 fragments
 SOUNDSYNC_KEY=$(cat secret.key) wendy run --device <device>
 ```
 
+HTTP needs `Authorization: Bearer <token>` on every request; the token is the
+first 16 hex characters of HMAC-SHA256(key, "anchor-http") (see `anchor.py`).
+Control endpoints are POST-only and allowlisted.
+
 Output: `<OUT_DIR>/<node>/<anchor_us>-f<n>.wav|json` per fragment and
 `<OUT_DIR>/events/<anchor_us>.wav|json` per event (one channel per node).
 `clocks.py` (Line, band) is adopted from esp-pingpong's `box/taploc.py`.

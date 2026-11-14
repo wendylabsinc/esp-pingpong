@@ -1,10 +1,11 @@
-"""Ground truth for the Anchor's node-to-Anchor placement (the "±20 us" claim).
+"""Ground truth for the Anchor's node-to-Anchor placement.
 
 The node drives a wire into the Anchor's dongle. The dongle's esp_timer IS the
 Anchor timeline, so its interrupt stamp of an edge is the true Anchor time.
 The node's own stamp of the same edge is placed on Anchor time exactly as
 anchor.py places samples: band() over (node arrival of beacon seq, dongle
-esp_timer just before sending seq), beacons within 30 s, floor 20 us.
+esp_timer just before sending seq), beacons within 30 s. (This test showed
+the original 20 us error floor was wrong by ~30x; anchor.py now uses 1 ms.)
 usage: anchor_truth.py node.csv dongle.csv"""
 import sys, os
 import numpy as np
@@ -37,7 +38,7 @@ for e, lvl in nG:
     w = np.abs(pa[:, 0] - e) < 30e6
     if w.sum() < 20:
         continue
-    line = band([tuple(r) for r in pa[w]], floor_us=20.0)
+    line = band([tuple(r) for r in pa[w]], floor_us=1000.0)
     pred, s = line(e)
     j = np.argmin(np.abs(de - pred))
     if abs(de[j] - pred) < 5000 and dl[j] == lvl:

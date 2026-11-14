@@ -302,22 +302,56 @@ def serve_files():
         return
     from urllib.parse import urlparse, parse_qs
 
+    import re
+    # Every request needs the token: fragments are room audio, and the control
+    # endpoints drive the radio. Token = first 16 hex of HMAC-SHA256(key,
+    # "anchor-http"); print it with: python -c "import hmac,hashlib;print(hmac.new(
+    # bytes.fromhex(open('secret.key').read().strip()),b'anchor-http',hashlib.sha256).hexdigest()[:16])"
+    token = hmac.new(KEY, b"anchor-http", hashlib.sha256).hexdigest()[:16]
+    allowed = re.compile(r"(beacon (on|off)|rate \d{1,3}|ap (on|off)|gpio \d{1,2}|drive \d{1,2} \d{1,3}|ch \d{1,2}|id)")
+
     class Handler(http.server.SimpleHTTPRequestHandler):
-        """Files under OUT, plus:
-        /cmd?line=<dongle command>      e.g. /cmd?line=gpio%206
-        /capture?seconds=<n>            raw dongle lines -> captures/<t>.csv"""
+        """With header "Authorization: Bearer <token>":
+        GET  /...                         fragments, events, captures
+        POST /cmd?line=<dongle command>   allowlisted, e.g. line=gpio%206
+        POST /capture?seconds=<n>         raw dongle lines -> captures/<t>.csv"""
+        def _authorized(self):
+            got = self.headers.get("Authorization", "")
+            if hmac.compare_digest(got.encode(), f"Bearer {token}".encode()):
+                return True
+            self.send_error(401, "token required")
+            return False
+
         def do_GET(self):
+            if not self._authorized():
+                return
+            return super().do_GET()
+
+        def do_HEAD(self):
+            if not self._authorized():
+                return
+            return super().do_HEAD()
+
+        def do_POST(self):
+            if not self._authorized():
+                return
             u = urlparse(self.path); q = parse_qs(u.query)
             if u.path == "/cmd" and "line" in q:
-                send_cmd(q["line"][0])
-                return self._text(f"sent: {q['line'][0]}\n")
+                line = q["line"][0].strip()
+                if not allowed.fullmatch(line):
+                    return self.send_error(400, "command not allowed")
+                send_cmd(line)
+                return self._text(f"sent: {line}\n")
             if u.path == "/capture":
-                secs = float(q.get("seconds", ["60"])[0])
+                try:
+                    secs = min(max(float(q.get("seconds", ["60"])[0]), 1.0), 3600.0)
+                except ValueError:
+                    return self.send_error(400, "bad seconds")
                 d = os.path.join(OUT, "captures"); os.makedirs(d, exist_ok=True)
                 path = os.path.join(d, f"{int(time.time())}.csv")
                 capture.update(f=open(path, "w"), until=time.monotonic() + secs, path=path)
                 return self._text(f"capturing {secs:.0f} s to /captures/{os.path.basename(path)}\n")
-            return super().do_GET()
+            return self.send_error(404)
 
         def _text(self, body):
             b = body.encode()

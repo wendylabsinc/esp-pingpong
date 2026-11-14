@@ -95,9 +95,40 @@ static void crypto_init(void)
     g_boot_id = esp_random();
 }
 
-/* Replay guard per beacon source: a new boot id restarts its sequence. */
-static uint8_t s_last_src[6];
-static uint32_t s_last_boot, s_last_seq;
+/* Replay guard, one slot per beacon source (MAC): a frame must carry a newer
+ * sequence number than the last one accepted from that source under the same
+ * boot id; a new boot id restarts the sequence. Oldest slot is reused. */
+#define REPLAY_SLOTS 16
+static struct {
+    uint8_t src[6];
+    uint32_t boot, seq;
+    int64_t used;
+} s_replay[REPLAY_SLOTS];
+
+static bool replay_accept(const uint8_t *src, uint32_t boot, uint32_t seq, int64_t now)
+{
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < REPLAY_SLOTS; i++) {
+        if (s_replay[i].used && !memcmp(s_replay[i].src, src, 6)) {
+            slot = i;
+            break;
+        }
+        if (s_replay[i].used < s_replay[oldest].used) {
+            oldest = i;
+        }
+    }
+    if (slot >= 0 && s_replay[slot].boot == boot && seq <= s_replay[slot].seq) {
+        return false;
+    }
+    if (slot < 0) {
+        slot = oldest;
+        memcpy(s_replay[slot].src, src, 6);
+    }
+    s_replay[slot].boot = boot;
+    s_replay[slot].seq = seq;
+    s_replay[slot].used = now;
+    return true;
+}
 
 /* Fragment chunks heard over ESP-NOW, forwarded to USB as base64 lines
  * ("F,<src>,<b64>"): this is the Anchor-radio role. */
@@ -218,13 +249,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     uint32_t seq, boot;
     memcpy(&seq, data + 4, 4);
     memcpy(&boot, data + 16, 4);
-    if (!memcmp(s_last_src, info->src_addr, 6) && boot == s_last_boot && seq <= s_last_seq) {
+    if (!replay_accept(info->src_addr, boot, seq, now)) {
         s_replays++;
         return;
     }
-    memcpy(s_last_src, info->src_addr, 6);
-    s_last_boot = boot;
-    s_last_seq = seq;
     e.a = seq;
     push(&e);
     /* Log it for fragments, and treat the beacon source as the Anchor. */
