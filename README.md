@@ -257,6 +257,41 @@ ESP32's built-in USB serial console falling behind. The tests above staggered
 the nodes' sends. Binary framing, a larger blocking USB buffer and
 acknowledgements from the dongle are the fix.
 
+### Three nodes (2026-11-14)
+
+Three XIAOs about 5 cm from the Dragonwing's buzzer, 10 codes
+(`sync-fw/tools/run_three.sh`). Node-to-node difference per code, B - A:
+
+| Pair | Codes in both | Median | Std | Worst from median |
+| --- | --- | --- | --- | --- |
+| 4824, 4e58 | 4 | -161 us | 67 us | 150 us |
+| 4e58, 4ff8 | 4 | +48 us | 13 us | 21 us |
+| 4824, 4ff8 | 4 | -113 us | 62 us | 141 us |
+
+The medians include the nodes' different distances to the buzzer (not
+measured). The three pairs close: for each code all three nodes caught, the
+pairwise differences sum to within 0.1 us of zero, so the beacon mappings are
+consistent and the scatter comes from locating the code in the audio. Both
+larger scatters come from one code that node 4824 located about 150 us off at
+low correlation quality. Four codes per pair is a small sample.
+
+Delivery is the open problem: only 4 of 10 codes reached the Anchor from both
+nodes of a pair.
+
+- **Room noise.** At +12 dB, nodes kept triggering on room noise and filled
+  the radio link; a 16 s level sample showed room peaks of about +8 dB at
+  1.8 kHz. The code reached +25 dB at 2.7 kHz on both nodes sampled but only +5
+  to +10 dB at 1.8 kHz, so `bands clear`, `band 2700 18` keeps the code and drops
+  the room. Shorter fragments (`pre 300`, `post 700`) halve the load. These are
+  serial settings; the firmware defaults are 2.7 and 1.8 kHz at +12 dB.
+- **Send slots.** Each node waits `slot x 1.8 s` (slot from its MAC address,
+  `slot <n>` overrides) before its first send of a fragment, so nodes that heard
+  the same sound do not all send at once.
+- **Pieces still lost.** With the Anchor draining USB on its own thread, single
+  pieces still go missing (mostly from the busiest node) while the dongle
+  reports no queue drops. `GET /stats` on the Anchor shows which pieces and
+  counts lines that arrive truncated, which separates USB loss from radio loss.
+
 The WendyOS agent's `gpio` entitlement mounts only `/dev/gpiochip0`-`7`; the
 Dragonwing's ninth chip carries pin 33, so the Anchor drives that expander over
 I2C (`anchor/tca9538.py`, `i2c` entitlement) instead.

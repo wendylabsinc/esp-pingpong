@@ -15,7 +15,15 @@ SOUNDSYNC_KEY=$(cat secret.key) wendy run --device <device>
 
 HTTP needs `Authorization: Bearer <token>` on every request; the token is the
 first 16 hex characters of HMAC-SHA256(key, "anchor-http") (see `anchor.py`).
-Control endpoints are POST-only and allowlisted.
+Control endpoints are POST-only and allowlisted. `GET /stats` reports line
+counts, fragments still missing pieces (with which pieces), base64 errors on
+the USB link and the dongle's last `I` line, for diagnosing delivery loss.
+
+The ESP-IDF USB-Serial-JTAG console gives up on output after a short timeout
+when the host is not reading, so `usbserial.py` drains the endpoint on its own
+thread and parsing runs separately. Pieces are still lost after this change
+(unexplained as of 2026-11-14; `/stats` counts where). Each line keeps the time of the USB
+read that delivered it, so the USB ping map is not widened by parsing delays.
 
 Output: `<OUT_DIR>/<node>/<anchor_us>-f<n>.wav|json` per fragment and
 `<OUT_DIR>/events/<anchor_us>.wav|json` per event (one channel per node).

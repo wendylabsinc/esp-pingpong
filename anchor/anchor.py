@@ -34,6 +34,7 @@ KEY = bytes.fromhex(_key_text.strip())
 assert len(KEY) == 32, "SOUNDSYNC_KEY must be 64 hex characters"
 TAG_LEN, SSF_HDR = 8, 20
 bad_tags = [0]
+b64_errors = [0]                  # F lines that are not valid base64 (truncated on USB)
 
 def tag_ok(frame):
     return len(frame) > TAG_LEN and hmac.compare_digest(
@@ -44,6 +45,7 @@ tx_lock = threading.Lock()
 host_map = collections.deque(maxlen=200)   # (host_ns_mid, anchor_esp_us, half_rtt_ns)
 pending_ping = {}
 parts = {}                       # (src, frag) -> {idx: bytes}
+part_count = {}                  # (src, boot, frag) -> pieces expected
 
 def mac(b):
     return b.hex()
@@ -212,6 +214,8 @@ def write_event(ev):
             f"{n['node'][-4:]} {n['trigger_minus_first_us']:+.1f} us (±{n['sigma_us']:.1f})" for n in nodes), flush=True)
 
 line_counts = collections.Counter()
+last_info = [""]
+completed = collections.Counter()   # src -> fragments completed
 dongle = [None]
 dongle_lock = threading.Lock()
 capture = {"f": None, "until": 0.0, "path": None}
@@ -226,7 +230,10 @@ def reader(s):
         if time.monotonic() - last > 10:
             last = time.monotonic()
             pending_pieces = sum(len(v) for v in parts.values())
-            print(f"stats: lines {dict(line_counts)}, bad tags {bad_tags[0]}, pieces waiting {pending_pieces} in {len(parts)} fragments", flush=True)
+            gap = s.take_max_gap_ms() if hasattr(s, "take_max_gap_ms") else -1
+            backlog = len(s.buf) if hasattr(s, "buf") else -1
+            print(f"stats: lines {dict(line_counts)}, bad tags {bad_tags[0]}, pieces waiting {pending_pieces} in {len(parts)} fragments, "
+                  f"usb max read gap {gap:.0f} ms, backlog {backlog} B", flush=True)
         try:
             raw = s.readline().decode(errors="replace").strip()
             if capture["f"]:
@@ -238,6 +245,7 @@ def reader(s):
             if raw:
                 line_counts[raw[0] if raw[0] in "TFPAEI" else "?"] += 1
             if raw.startswith("I,"):
+                last_info[0] = raw
                 print(raw, flush=True)
             handle(raw)
         except Exception as e:  # one bad line must not stop the anchor
@@ -259,13 +267,17 @@ def handle(line):
             _, tok, esp = line.split(",")
             t0 = pending_ping.pop(tok, None)
             if t0:
-                t1 = time.monotonic_ns()
+                t1 = getattr(dongle[0], "line_ns", 0) or time.monotonic_ns()
                 host_map.append(((t0 + t1) // 2, int(esp), (t1 - t0) // 2))
         elif kind == "F":
             _, src, b64 = line.split(",", 2)
             try:
-                pkt = base64.b64decode(b64)
+                pkt = base64.b64decode(b64, validate=True)
             except Exception:
+                b64_errors[0] += 1
+                return
+            if len(pkt) <= SSF_HDR + TAG_LEN:
+                b64_errors[0] += 1
                 return
             if not tag_ok(pkt):
                 bad_tags[0] += 1
@@ -275,8 +287,11 @@ def handle(line):
             frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
             key = (src, boot, frag)
             parts.setdefault(key, {})[idx] = pkt[SSF_HDR:-TAG_LEN]
+            part_count[key] = count
             if len(parts[key]) == count:
                 got = parts.pop(key)
+                part_count.pop(key, None)
+                completed[src] += 1
                 blob = b"".join(got[i] for i in range(count))[:blen]
                 try:
                     meta, pcm = parse_blob(blob)
@@ -419,6 +434,7 @@ def serve_files():
     class Handler(http.server.SimpleHTTPRequestHandler):
         """With header "Authorization: Bearer <token>":
         GET  /...                         fragments, events, captures
+        GET  /stats                       line counts, incomplete fragments, USB health
         POST /cmd?line=<dongle command>   allowlisted, e.g. line=gpio%206
         POST /capture?seconds=<n>         raw dongle lines -> captures/<t>.csv"""
         def _authorized(self):
@@ -431,6 +447,18 @@ def serve_files():
         def do_GET(self):
             if not self._authorized():
                 return
+            if self.path == "/stats":
+                inc = [{"src": k[0], "frag": k[2], "have": len(v),
+                        "count": part_count.get(k),
+                        "missing_sample": sorted(set(range(part_count.get(k) or (max(v) + 1))) - set(v))[:12]}
+                       for k, v in list(parts.items())]
+                usb = dongle[0]
+                return self._text(json.dumps({
+                    "lines": dict(line_counts), "bad_tags": bad_tags[0], "b64_errors": b64_errors[0],
+                    "usb_max_data_gap_ms": round(getattr(usb, "max_data_gap_ms", -1), 1), "completed": dict(completed),
+                    "incomplete": inc, "dongle_info": last_info[0],
+                    "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": len(getattr(usb, "buf", b"")),
+                }, indent=1) + "\n")
             if self.path == "/gpiochips":
                 import gpioline
                 return self._text(json.dumps(gpioline.chips(), indent=1) + "\n")
