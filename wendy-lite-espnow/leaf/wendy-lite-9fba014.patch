@@ -1,0 +1,60 @@
+diff --git a/components/wendy_net/idf_component.yml b/components/wendy_net/idf_component.yml
+index ee48783..611254d 100644
+--- a/components/wendy_net/idf_component.yml
++++ b/components/wendy_net/idf_component.yml
+@@ -2,7 +2,7 @@ dependencies:
+   espressif/wasm-micro-runtime:
+     version: "~2.4.0"
+     rules:
+-      - if: "target != esp32s31 && $CONFIG{WENDY_NET} == True"
++      - if: "target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True"
+   wendy_safety:
+     override_path: "../wendy_safety"
+   wendy_callback:
+diff --git a/components/wendy_net_peer/idf_component.yml b/components/wendy_net_peer/idf_component.yml
+index 0d6c957..5ddaf67 100644
+--- a/components/wendy_net_peer/idf_component.yml
++++ b/components/wendy_net_peer/idf_component.yml
+@@ -4,4 +4,4 @@ dependencies:
+   wendy_net:
+     override_path: "../wendy_net"
+     rules:
+-      - if: "target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True && $CONFIG{WENDY_NET} == True"
++      - if: "target != esp32s31 && $CONFIG{WENDY_CORE_WASM_APP_SUPPORT} == True"
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index a02b5ae..4d79998 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -2,5 +2,5 @@ idf_component_register(
+     SRCS "wendy_main.c"
+     INCLUDE_DIRS "."
+     REQUIRES wendy_core
+-    PRIV_REQUIRES wendy_pki wendy_sensor_link wendy_benchmark wendy_display
++    PRIV_REQUIRES wendy_pki wendy_sensor_link wendy_benchmark wendy_espnow wendy_display
+ )
+diff --git a/main/wendy_main.c b/main/wendy_main.c
+index f6d5921..30c02c7 100644
+--- a/main/wendy_main.c
++++ b/main/wendy_main.c
+@@ -1,6 +1,9 @@
+ #include "wendy_core.h"
+ #include "wendy_pki_crypto.h"
+ #include "esp_log.h"
++#if CONFIG_WENDY_ESPNOW
++#include "wendy_espnow.h"
++#endif
+ 
+ #if CONFIG_WENDY_SENSOR_LINK_XIAO_ESP32S3 || CONFIG_WENDY_SENSOR_LINK_ESP32S31_KORVO_1
+ #include "wendy_sensor_link.h"
+@@ -24,6 +27,11 @@ void app_main(void)
+     }
+ #endif
+     ESP_ERROR_CHECK(wendy_core_init());
++#if CONFIG_WENDY_ESPNOW
++    if (wendy_espnow_start() != ESP_OK) {
++        ESP_LOGW("main", "ESP-NOW link could not start");
++    }
++#endif
+ #if CONFIG_WENDY_DISPLAY_ESP32S31_KORVO_1
+     esp_err_t display_err = wendy_display_start();
+     if (display_err != ESP_OK) {
