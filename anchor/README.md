@@ -299,26 +299,22 @@ above the room noise at the boards:
   showed 22 to 32 dB over the room at all three boards and was placed at the
   same spot on two tries, 38 cm from one board and 41 cm from another, with a
   phone playing sweeps in the room at the same time.
-- **Movement**: an orange arrow joins two heard sweeps when the second came
-  within 12 seconds, at a different place (further apart than half of what the
-  two 95% regions reach towards each other, and 10 cm), and near enough to have
-  been walked (2.5 m/s, with the regions' reach as slack): `tracks()` in
-  `mesh.html`. The band around the arrow is where the path could lie: as wide
-  at each end as that sweep's region is across the line, strongest along the
-  line. Other kinds of sound get no arrow. This is drawn by the page from two
-  placed sounds; the Anchor does no tracking. The dotted orange lines (a ray for
-  a sound with a direction only, and lines from the newest sound to each board)
-  are gone: a sound without a place is listed in the table only.
-  Sweeps heard one after another in the same listening round count as well:
-  `place_heard` in `anchor.py` gives each placed sweep the moment it was heard,
-  and only merges repeats that follow each other. A path does not fork. A sweep
-  on a path is drawn as its cross alone; its own region is left out, and the
-  band runs on past the path's two loose ends by what those regions reach.
-  How much of a path there can be (measured 2026-11-15): a listening round
-  records 1.27 s per board and one starts about every 5.0 s (4.5 to 6.6), the
-  rest being radio time for three recordings. The boards hear a quarter of the
-  time. A clip with a sweep every 0.4 s gives three points per round, then
-  nothing for about 3.7 s.
+- **The path of sweeps**: every sweep the Anchor places becomes a point on one
+  path, in the order the sweeps were heard, each joined to the one before.
+  Nothing is left out for being too near, too far or too fast. The path ends
+  only when no sweep at all was heard for the time set under the map ("A path
+  of sweeps ends after N s without a sweep", 5 s to begin with, remembered by
+  the browser); the next sweep begins a new path, and the one that ended fades
+  out. Sweeps that keep coming from one spot are one sound for the Anchor and
+  so one point, kept up to date. A sweep with a direction only has no point but
+  keeps the path alive. Other kinds of sound are never part of it. Around each
+  stretch is the band its line could lie in, as wide at each point as that
+  sweep's 95% region is across the line; a sweep's own region is drawn only
+  while the path is a single point. The path is kept by the page (`follow()` in
+  `mesh.html`, tested by `path_test.js`), since the Anchor lists only its last
+  twenty sounds. The dotted orange lines (a ray for a sound with a direction
+  only, and lines from the newest sound to each board) are gone: a sound without
+  a place is listed in the table only.
 - **Turn left, Turn right, Mirror** (and Shift with scroll): turn or mirror the
   picture so it matches the room as you stand in it. Distances alone fix the
   boards' shape but not which way it faces, nor whether it is mirrored. This

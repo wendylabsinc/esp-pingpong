@@ -28,6 +28,7 @@
   button:disabled { color:var(--dim); cursor:default; }
   #kinds { margin:0 0 8px; color:var(--dim); }
   #zoomer { margin:8px 0 0; }
+  #quiet { width:4.2em; font:inherit; color:inherit; background:transparent; border:1px solid var(--line); border-radius:6px; padding:2px 6px; }
   #zoomer button { padding:2px 11px; min-width:2.2em; }
   #map { touch-action:none; }
   #kinds button { padding:2px 9px; }
@@ -74,9 +75,10 @@
       Dotted lines join the anchor to the boards its radio hears; it measures no distance to them.
       Sound gives distances only, so the picture may be turned or mirrored against the room.
       A sound heard by three or more boards is drawn where its arrival times put it, with the region it is
-      95% likely to be in. An orange arrow joins two heard sweeps when the second came within
-      12 seconds, somewhere else, and near enough to have been walked: something that moved. The band around
-      the arrow is where its path could lie, as wide at each end as that sound's region, strongest in the middle.</p>
+      95% likely to be in. Sweeps are joined into one orange path in the order they were heard, each to the
+      one before; the path ends when no sweep was heard for the time set under the map, and the next sweep
+      begins a new one. The band around it is where the path could lie, as wide at each point as that
+      sweep's region, strongest in the middle.</p>
   </section>
   <aside>
     <section><h2>Sounds</h2>
@@ -85,7 +87,9 @@
         <button data-kind="faint" title="A sound with no clear start, placed by lining up the boards' whole recordings">Faint</button>
         <button data-kind="sweep" title="A 2 to 6 kHz sweep found in a listening round">Sweeps</button>
         <button data-kind="buzzer" title="The boards' own buzzers, placed in every ranging round">Board buzzers</button>
-      </span></p>
+      </span>
+      <label for="quiet" title="Sweeps are joined into one path in the order they are heard. The path ends when no sweep was heard for this long; the next sweep begins a new one.">A path of sweeps ends after
+        <input id="quiet" type="number" min="1" max="600" step="1" value="5"> s without a sweep</label></p>
       <div id="sounds" class="scroll"></div></section>
     <section><h2>Distances</h2><div id="edges" class="scroll"></div></section>
     <section><h2>Boards</h2><div id="nodes" class="scroll"></div></section>
@@ -259,49 +263,57 @@ function drawMap(s) {
     h += `<circle cx="${drag.sx}" cy="${drag.sy}" r="8" fill="var(--accent)" stroke="var(--panel)" stroke-width="2"/>`
        + `<text x="${drag.sx}" y="${drag.sy + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(held))}</text>`;
   }
-  // Movement: a line from where a sound was to where the same kind of sound came next (tracks()). It lives
-  // and fades with its later end; the earlier end may have faded from the map by then.
-  // A sound on a path is drawn as its cross alone: its own region under the band was a muddle. What the
-  // region said along the path is kept at the path's two loose ends, where the band runs on that far.
-  const paths = tracks((s.sources || []).filter(q => shows[kind(q)])).filter(t => heard.includes(t.to));
-  const onPath = new Set(paths.flatMap(t => [t.from, t.to]));
-  const begins = new Set(paths.map(t => t.from)), ends = new Set(paths.map(t => t.to));
-  for (const t of paths) {
-    const fade = s.demo ? (t.to === heard[heard.length - 1] ? 1 : .45) : Math.max(0, 1 - age(t.to) / FADE_S);
-    const x1 = PX(t.from.x, t.from.y), y1 = PY(t.from.x, t.from.y), x2 = PX(t.to.x, t.to.y), y2 = PY(t.to.x, t.to.y);
-    const len = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / len, uy = (y2 - y1) / len;
-    const tipx = x2 - 9 * ux, tipy = y2 - 9 * uy;   // the arrow stops short of the later sound's cross
-    const metresMoved = Math.hypot(t.to.x - t.from.x, t.to.y - t.from.y);
-    // The band the path could lie in: as wide at each end as that sound's 95% region is across the line
-    // (across()), narrowing or widening evenly in between. Drawn as layers, each narrower than the last, so it
-    // is strongest along the line and thins out to nothing at the region's edge.
-    const mdx = (t.to.x - t.from.x) / metresMoved, mdy = (t.to.y - t.from.y) / metresMoved;   // along the path, on the map
-    const w1 = across(t.from, -mdy, mdx) * k, w2 = across(t.to, -mdy, mdx) * k;                   // half-widths, pixels
-    const back = ends.has(t.from) ? 0 : across(t.from, mdx, mdy) * k, on = begins.has(t.to) ? 0 : across(t.to, mdx, mdy) * k;
-    const ax = x1 - ux * back, ay = y1 - uy * back, bx = x2 + ux * on, by = y2 + uy * on;   // the band's ends, pixels
-    let band = '';
-    for (const f of [1, .82, .64, .48, .32, .18])
-      band += `<path d="M${ax - uy * w1 * f} ${ay + ux * w1 * f}L${bx - uy * w2 * f} ${by + ux * w2 * f}L${bx + uy * w2 * f} ${by - ux * w2 * f}L${ax + uy * w1 * f} ${ay - ux * w1 * f}Z" fill="var(--sound)" fill-opacity=".07"/>`;
-    h += `<g opacity="${fade}"><title>Moved ${metresMoved.toFixed(2)} m in ${t.gap.toFixed(1)} s (${(metresMoved / t.gap).toFixed(1)} m/s); the band is where the path could lie</title>`
-       + band + `<line x1="${x1}" y1="${y1}" x2="${tipx}" y2="${tipy}" stroke="var(--sound)" stroke-width="2.5" stroke-linecap="round"/>`
-       + (len > 24 ? `<path d="M${tipx} ${tipy}L${tipx - 9 * ux + 5 * uy} ${tipy - 9 * uy - 5 * ux}L${tipx - 9 * ux - 5 * uy} ${tipy - 9 * uy + 5 * ux}Z" fill="var(--sound)"/>` : '')
-       + '</g>';
+  // The path of sweeps (follow()): its points joined in the order they were heard, older stretches paler,
+  // an arrowhead on the newest. Around each stretch the band its line could lie in: as wide at each end
+  // as that sweep's 95% region is across the line, in layers so it is strongest along the line; at the
+  // path's two loose ends it runs on by what those regions reach. A sweep's own region is drawn only
+  // while the path is a single point. A path that has just ended fades out.
+  const strand = (nodes, alpha) => {
+    const n = nodes.length;
+    let out = `<g opacity="${alpha}">`;
+    for (let i = 1; i < n; i++) {
+      const a = nodes[i - 1], b = nodes[i], last = i === n - 1;
+      const x1 = PX(a.x, a.y), y1 = PY(a.x, a.y), x2 = PX(b.x, b.y), y2 = PY(b.x, b.y);
+      const len = Math.hypot(x2 - x1, y2 - y1), moved = Math.hypot(b.x - a.x, b.y - a.y);
+      if (len < 0.5 || !moved) continue;   // the same spot again: nothing to draw between them
+      const ux = (x2 - x1) / len, uy = (y2 - y1) / len, mdx = (b.x - a.x) / moved, mdy = (b.y - a.y) / moved;
+      const w1 = across(a, -mdy, mdx) * k, w2 = across(b, -mdy, mdx) * k;                       // half-widths, pixels
+      const back = i === 1 ? across(a, mdx, mdy) * k : 0, on = last ? across(b, mdx, mdy) * k : 0;
+      const ax = x1 - ux * back, ay = y1 - uy * back, bx = x2 + ux * on, by = y2 + uy * on;     // the band's ends, pixels
+      const tip = last && len > 24 ? 9 : 0, tx = x2 - tip * ux, ty = y2 - tip * uy;             // the arrow stops short of the newest cross
+      out += `<g opacity="${(0.35 + 0.65 * i / (n - 1)).toFixed(2)}"><title>Moved ${moved.toFixed(2)} m in ${Math.max(0, b.t - a.t).toFixed(1)} s; the band is where the path could lie</title>`;
+      for (const f of [1, .82, .64, .48, .32, .18])
+        out += `<path d="M${ax - uy * w1 * f} ${ay + ux * w1 * f}L${bx - uy * w2 * f} ${by + ux * w2 * f}L${bx + uy * w2 * f} ${by - ux * w2 * f}L${ax + uy * w1 * f} ${ay - ux * w1 * f}Z" fill="var(--sound)" fill-opacity=".07"/>`;
+      out += `<line x1="${x1}" y1="${y1}" x2="${tx}" y2="${ty}" stroke="var(--sound)" stroke-width="2.5" stroke-linecap="round"/>`
+           + (tip ? `<path d="M${tx} ${ty}L${tx - 9 * ux + 5 * uy} ${ty - 9 * uy - 5 * ux}L${tx - 9 * ux - 5 * uy} ${ty - 9 * uy + 5 * ux}Z" fill="var(--sound)"/>` : '')
+           + `<circle cx="${x1}" cy="${y1}" r="3" fill="var(--sound)"/></g>`;
+    }
+    const p = nodes[n - 1], x = PX(p.x, p.y), y = PY(p.x, p.y), e = p.ellipse;
+    if (n === 1)
+      out += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`;
+    return out + `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`
+               + `<text x="${x}" y="${y - 12}" text-anchor="middle" font-weight="600" fill="var(--sound)">${esc(said(p))}${n > 1 ? `, ${n} points` : ''}</text></g>`;
+  };
+  if (shows.sweep) {
+    const since = chain.old ? Date.now() / 1000 - chain.old.at : 9;
+    if (since >= 0 && since < 1.5) h += strand(chain.old.nodes, 1 - since / 1.5);
+    if (chain.nodes.length) h += strand(chain.nodes, 1);
   }
   heard.forEach((q, i) => {  // oldest first, so the newest is drawn on top and strongest
     // A buzzer placed from a ranging round (it has a note) stays fully drawn: it is a standing check of the map.
+    if (kind(q) === 'sweep') return;   // sweeps are drawn as the path above, and only there
     const newest = i === heard.length - 1;
     const fade = !s.demo ? Math.max(0, 1 - age(q) / FADE_S) : newest || (q.note || '').startsWith('buzzer') ? 1 : Math.max(0.12, 0.5 - 0.08 * (heard.length - 2 - i));
     const what = `${q.note ? q.note[0].toUpperCase() + q.note.slice(1) : 'Sound'} ${q.age_s.toFixed(0)} s ago: ${q.boards.map(b => `${named(b.node)} ${metres(b.distance_mm)}`).join(', ')}`;
     h += `<g opacity="${fade}"><title>${esc(what)}</title>`;
     if (!q.far) {  // a sound with a direction and hardly a distance is in the table only: its ray across the map said little
       const x = PX(q.x, q.y), y = PY(q.x, q.y), e = q.ellipse;
-      if (!onPath.has(q))
-        h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`;
+      h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`;
       h += `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`;
       if (newest) {
         if (q.alt) h += `<circle cx="${PX(q.alt.x, q.alt.y)}" cy="${PY(q.alt.x, q.alt.y)}" r="5" fill="none" stroke="var(--sound)" stroke-dasharray="2 2"><title>These arrival times fit this spot as well</title></circle>`;
         h += `<text x="${x}" y="${y - 12}" text-anchor="middle" font-weight="600" fill="var(--sound)">${esc(said(q))}</text>`;
-      } else if (q.note && !onPath.has(q)) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;   // on a path only the newest is named
+      } else if (q.note) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;
     }
     h += '</g>';
   });
@@ -512,34 +524,55 @@ function demoBar(s) {  // how many boards there are, and no more than a ranging 
 
 let timer = null;
 const FADE_S = 10;
-// Movement. Two sweeps heard in listening rounds are taken as one thing that moved when the later one came within
-// TRACK_S seconds, far enough from the earlier one to be a different place (more than half of what the two
-// 95% regions reach towards each other, and TRACK_MIN_M), and near enough to have been walked (TRACK_MPS,
-// with the regions' reach as slack). Each sound follows at most one earlier sound: the latest that fits.
-// Several sweeps heard in one listening round count too: the Anchor gives each the moment it was heard.
-// Other kinds of sound (faint ones, a board's own buzzer) are never part of a path.
-const TRACK_S = 12, TRACK_MPS = 2.5, TRACK_MIN_M = 0.1, TRACK_GAP_S = 0.15;   // sweeps one after another in a clip are this far apart at least
+let quietS = 5;   // a path of sweeps ends after this many seconds without one; set on the page and remembered
+try { quietS = Math.min(600, Math.max(1, +localStorage.getItem('mesh.quiet') || 5)); } catch (e) { /* private window: not remembered */ }
+$('quiet').value = quietS;
+$('quiet').addEventListener('change', () => {
+  quietS = Math.min(600, Math.max(1, +$('quiet').value || 5));
+  $('quiet').value = quietS;
+  try { localStorage.setItem('mesh.quiet', String(quietS)); } catch (e) { /* as above */ }
+});
+// The path of sweeps. Every sweep the Anchor places becomes a point on one path, in the order the sweeps
+// were heard, each joined to the one before; nothing is left out for being too near or too far. The path
+// ends only when no sweep at all was heard for `quiet` seconds (set on the page), and the next sweep
+// begins a new one. Sweeps that keep coming from one spot are one sound for the Anchor ("sweep heard,
+// 8 times"): one point, kept up to date. A sweep with a direction only has no point but keeps the path
+// alive. Other kinds of sound are never part of it. The Anchor lists only its last twenty sounds, so the
+// path is kept here.
 function across(q, ux, uy) {  // how far the sound's 95% region reaches from its middle in the direction (ux, uy), metres
   const e = q.ellipse, c = Math.cos(e.angle_rad), si = Math.sin(e.angle_rad);
   const along = (ux * c + uy * si) / Math.max(e.major_m, 1e-3), across = (-ux * si + uy * c) / Math.max(e.minor_m, 1e-3);
   return 1 / Math.hypot(along, across);
 }
-function tracks(sources) {   // -> [{ from, to }], from the earlier sound to the later
-  const placed = sources.filter(q => !q.far && kind(q) === 'sweep');   // sweeps only: other sounds are too loosely placed to call it movement
-  const out = [], left = new Set();   // left: sounds a path already leaves from; a path does not fork
-  for (const to of placed.slice().sort((a, b) => b.age_s - a.age_s)) {   // oldest first
-    let best = null;
-    for (const from of placed) {
-      const gap = from.age_s - to.age_s;
-      if (left.has(from) || gap < TRACK_GAP_S || gap > TRACK_S || (best && gap >= best.gap)) continue;
-      const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy);
-      if (d < TRACK_MIN_M) continue;
-      const slack = across(from, dx / d, dy / d) + across(to, dx / d, dy / d);
-      if (d > slack / 2 && d <= TRACK_MPS * gap + slack) best = { from, to, gap };
+const PATH_MAX = 600;   // points kept: at a sweep every 0.4 s, four minutes of walking
+const chain = { nodes: [], last: -Infinity, old: null, gone: new Set() };   // old: the path that just ended, while it fades out;
+                                                                             // gone: points dropped off the front of a very long path
+function endPath(chain, at) {
+  if (chain.nodes.length) chain.old = { nodes: chain.nodes, at };
+  chain.nodes = [];
+}
+function follow(chain, sources, now, quiet) {   // now: seconds; sources: what the Anchor lists this moment
+  const sweeps = sources.filter(q => kind(q) === 'sweep').map(q => ({ q, t: now - q.age_s })).sort((a, b) => a.t - b.t);
+  for (const { q, t } of sweeps) {
+    const node = chain.nodes.find(n => n.key === q.event);
+    if (node) {   // the same sound, heard again at its spot
+      if (!q.far) Object.assign(node, { x: q.x, y: q.y, ellipse: q.ellipse, note: q.note });
+      chain.last = Math.max(chain.last, t);
+      continue;
     }
-    if (best) { out.push(best); left.add(best.from); }
+    if (t - chain.last > quiet) endPath(chain, chain.last + quiet);   // silence before this one: it begins a new path
+    if (t <= chain.last) {
+      // Not newer than what the path holds: listed before (a sweep without a place comes by every time),
+      // or from before the path began. Only one that belongs inside the path, come in late, is put in.
+      const at = chain.nodes.findIndex(n => n.t > t);
+      if (!q.far && at > 0 && !chain.gone.has(q.event)) chain.nodes.splice(at, 0, { key: q.event, t, x: q.x, y: q.y, ellipse: q.ellipse, note: q.note });
+      continue;
+    }
+    chain.last = t;
+    if (!q.far) chain.nodes.push({ key: q.event, t, x: q.x, y: q.y, ellipse: q.ellipse, note: q.note });
+    if (chain.nodes.length > PATH_MAX) chain.gone.add(chain.nodes.shift().key);
   }
-  return out;
+  if (now - chain.last > quiet) endPath(chain, chain.last + quiet);
 }
 const seen = {};   // a placed sound -> when this page first saw it (ms) and how old it said it was
 function age(q) {
@@ -559,6 +592,7 @@ async function tick() {
       const s = await r.json();
       if (s.page_note) note = { text: s.page_note, until: Date.now() + 1000 };   // a press that came to nothing (the local page server says so)
       $('status').textContent = s.demo ? '· demo: these boards are made up' : s.page_age_s > 4 ? `· no answer from the Anchor for ${s.page_age_s.toFixed(0)} s (the cloud tunnel has stalled): what you see is that old` : note && Date.now() < note.until ? '· ' + note.text : '';
+      follow(chain, s.sources || [], Date.now() / 1000 - (s.page_age_s || 0), quietS);   // the moment the Anchor's answer is from
       for (const n of s.nodes) if (n.colour != null) colours[n.id] = n.colour;
       // Boards on the saved map that the radio no longer hears (reflashed to listen) are still drawn.
       for (const id in (s.layout ? s.layout.nodes : {}))
