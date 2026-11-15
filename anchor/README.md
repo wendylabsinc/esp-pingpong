@@ -308,6 +308,16 @@ above the room noise at the boards:
   placed sounds; the Anchor does no tracking. The dotted orange lines (a ray for
   a sound with a direction only, and lines from the newest sound to each board)
   are gone: a sound without a place is listed in the table only.
+  Sweeps heard one after another in the same listening round count as well:
+  `place_heard` in `anchor.py` gives each placed sweep the moment it was heard,
+  and only merges repeats that follow each other. A path does not fork. A sweep
+  on a path is drawn as its cross alone; its own region is left out, and the
+  band runs on past the path's two loose ends by what those regions reach.
+  How much of a path there can be (measured 2026-11-15): a listening round
+  records 1.27 s per board and one starts about every 5.0 s (4.5 to 6.6), the
+  rest being radio time for three recordings. The boards hear a quarter of the
+  time. A clip with a sweep every 0.4 s gives three points per round, then
+  nothing for about 3.7 s.
 - **Turn left, Turn right, Mirror** (and Shift with scroll): turn or mirror the
   picture so it matches the room as you stand in it. Distances alone fix the
   boards' shape but not which way it faces, nor whether it is mirrored. This

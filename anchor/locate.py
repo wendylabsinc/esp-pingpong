@@ -634,8 +634,9 @@ class Locator:
             self.sources.append(got)
         return got
 
-    def times(self, key, nodes, times_us, speed, note=None, sigma_us=None):
-        """Place a sound from arrival times that are already known (a buzzer's sweep in a ranging round)."""
+    def times(self, key, nodes, times_us, speed, note=None, sigma_us=None, at=None):
+        """Place a sound from arrival times that are already known (a buzzer's sweep in a ranging round).
+        `at`: when it was heard (time.time()), for sounds placed some time after they were recorded."""
         with self.lock:
             points = dict(self.points)
         if not points:
@@ -646,7 +647,7 @@ class Locator:
             got, why = None, repr(e)
         if got is None:
             return {"error": why}
-        got.update(event=key, at=time.time(), note=note)
+        got.update(event=key, at=time.time() if at is None else at, note=note)
         with self.lock:
             for old in [s for s in self.sources if s["event"] == key]:
                 self.sources.remove(old)
@@ -660,7 +661,7 @@ class Locator:
             return {"layout": dict(self.info, nodes={k: [round(v[0], 4), round(v[1], 4)] for k, v in self.points.items()})
                     if self.points else None,
                     "layout_why": None if self.points else self.why,
-                    "sources": [dict({k: v for k, v in s.items() if k != "at"}, age_s=round(now - s["at"], 1))
+                    "sources": [dict({k: v for k, v in s.items() if k != "at"}, age_s=round(now - s["at"], 2))
                                 for s in self.sources]}
 
 

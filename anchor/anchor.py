@@ -103,22 +103,28 @@ def place_heard(rid, groups):
     """Sweeps from elsewhere, heard in a listening round: placed like any sound."""
     # A sound that repeats (a phone playing sweeps) reaches the boards with the same differences each
     # time: those repeats are one sound, placed once from the middle of them.
-    kinds = []
+    # Sweeps in one round come one after another (a clip that plays one every so often), not at once: each
+    # placed sound keeps the moment it was heard, so the page can tell which came first and how much later
+    # the next one was. Only repeats that follow each other are merged: the same differences again after
+    # something else in between is the thing having come back, and is placed again.
+    kinds, whens = [], []
     for t in groups:
         first = min(t.values())
         later = {b: v - first for b, v in t.items()}
-        for kind in kinds:
-            if set(kind[0]) == set(later) and all(abs(kind[0][b] - later[b]) < 150 for b in later):
-                kind.append(later)
-                break
+        if kinds and set(kinds[-1][0]) == set(later) and all(abs(kinds[-1][0][b] - later[b]) < 150 for b in later):
+            kinds[-1].append(later)
+            whens[-1].append(first)
         else:
             kinds.append([later])
+            whens.append([first])
+    now, last = time.time(), max(max(w) for w in whens) if whens else 0
     for i, kind in enumerate(kinds):
         boards = sorted(kind[0])
         times = [float(np.median([k[b] for k in kind])) for b in boards]
         spread = max(max(k[b] for k in kind) - min(k[b] for k in kind) for b in boards)
         note = "sweep heard" + (f", {len(kind)} times" if len(kind) > 1 else "")
-        got = locator.times(f"heard-{rid}-{i}", boards, times, SOUND_SPEED, note=note, sigma_us=[20.0] * len(boards))
+        got = locator.times(f"heard-{rid}-{i}", boards, times, SOUND_SPEED, note=note, sigma_us=[20.0] * len(boards),
+                            at=now - (last - float(np.mean(whens[i]))) * 1e-6)
         print(f"round {rid}: {note} by {len(boards)} boards (arrival differences within {spread:.0f} us), "
               + (f"placed at x {got['x']:+.3f} y {got['y']:+.3f} m" + (" (direction only)" if got["far"] else "")
                  if "x" in got else f"not placed: {got['error']}"), flush=True)

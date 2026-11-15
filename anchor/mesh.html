@@ -261,8 +261,12 @@ function drawMap(s) {
   }
   // Movement: a line from where a sound was to where the same kind of sound came next (tracks()). It lives
   // and fades with its later end; the earlier end may have faded from the map by then.
-  for (const t of tracks((s.sources || []).filter(q => shows[kind(q)]))) {
-    if (!heard.includes(t.to)) continue;
+  // A sound on a path is drawn as its cross alone: its own region under the band was a muddle. What the
+  // region said along the path is kept at the path's two loose ends, where the band runs on that far.
+  const paths = tracks((s.sources || []).filter(q => shows[kind(q)])).filter(t => heard.includes(t.to));
+  const onPath = new Set(paths.flatMap(t => [t.from, t.to]));
+  const begins = new Set(paths.map(t => t.from)), ends = new Set(paths.map(t => t.to));
+  for (const t of paths) {
     const fade = s.demo ? (t.to === heard[heard.length - 1] ? 1 : .45) : Math.max(0, 1 - age(t.to) / FADE_S);
     const x1 = PX(t.from.x, t.from.y), y1 = PY(t.from.x, t.from.y), x2 = PX(t.to.x, t.to.y), y2 = PY(t.to.x, t.to.y);
     const len = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / len, uy = (y2 - y1) / len;
@@ -273,10 +277,12 @@ function drawMap(s) {
     // is strongest along the line and thins out to nothing at the region's edge.
     const mdx = (t.to.x - t.from.x) / metresMoved, mdy = (t.to.y - t.from.y) / metresMoved;   // along the path, on the map
     const w1 = across(t.from, -mdy, mdx) * k, w2 = across(t.to, -mdy, mdx) * k;                   // half-widths, pixels
+    const back = ends.has(t.from) ? 0 : across(t.from, mdx, mdy) * k, on = begins.has(t.to) ? 0 : across(t.to, mdx, mdy) * k;
+    const ax = x1 - ux * back, ay = y1 - uy * back, bx = x2 + ux * on, by = y2 + uy * on;   // the band's ends, pixels
     let band = '';
     for (const f of [1, .82, .64, .48, .32, .18])
-      band += `<path d="M${x1 - uy * w1 * f} ${y1 + ux * w1 * f}L${x2 - uy * w2 * f} ${y2 + ux * w2 * f}L${x2 + uy * w2 * f} ${y2 - ux * w2 * f}L${x1 + uy * w1 * f} ${y1 - ux * w1 * f}Z" fill="var(--sound)" fill-opacity=".07"/>`;
-    h += `<g opacity="${fade}"><title>Moved ${metresMoved.toFixed(2)} m in ${t.gap.toFixed(0)} s (${(metresMoved / t.gap).toFixed(1)} m/s); the band is where the path could lie</title>`
+      band += `<path d="M${ax - uy * w1 * f} ${ay + ux * w1 * f}L${bx - uy * w2 * f} ${by + ux * w2 * f}L${bx + uy * w2 * f} ${by - ux * w2 * f}L${ax + uy * w1 * f} ${ay - ux * w1 * f}Z" fill="var(--sound)" fill-opacity=".07"/>`;
+    h += `<g opacity="${fade}"><title>Moved ${metresMoved.toFixed(2)} m in ${t.gap.toFixed(1)} s (${(metresMoved / t.gap).toFixed(1)} m/s); the band is where the path could lie</title>`
        + band + `<line x1="${x1}" y1="${y1}" x2="${tipx}" y2="${tipy}" stroke="var(--sound)" stroke-width="2.5" stroke-linecap="round"/>`
        + (len > 24 ? `<path d="M${tipx} ${tipy}L${tipx - 9 * ux + 5 * uy} ${tipy - 9 * uy - 5 * ux}L${tipx - 9 * ux - 5 * uy} ${tipy - 9 * uy + 5 * ux}Z" fill="var(--sound)"/>` : '')
        + '</g>';
@@ -289,12 +295,13 @@ function drawMap(s) {
     h += `<g opacity="${fade}"><title>${esc(what)}</title>`;
     if (!q.far) {  // a sound with a direction and hardly a distance is in the table only: its ray across the map said little
       const x = PX(q.x, q.y), y = PY(q.x, q.y), e = q.ellipse;
-      h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`
-         + `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`;
+      if (!onPath.has(q))
+        h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`;
+      h += `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`;
       if (newest) {
         if (q.alt) h += `<circle cx="${PX(q.alt.x, q.alt.y)}" cy="${PY(q.alt.x, q.alt.y)}" r="5" fill="none" stroke="var(--sound)" stroke-dasharray="2 2"><title>These arrival times fit this spot as well</title></circle>`;
         h += `<text x="${x}" y="${y - 12}" text-anchor="middle" font-weight="600" fill="var(--sound)">${esc(said(q))}</text>`;
-      } else if (q.note) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;
+      } else if (q.note && !onPath.has(q)) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;   // on a path only the newest is named
     }
     h += '</g>';
   });
@@ -509,8 +516,9 @@ const FADE_S = 10;
 // TRACK_S seconds, far enough from the earlier one to be a different place (more than half of what the two
 // 95% regions reach towards each other, and TRACK_MIN_M), and near enough to have been walked (TRACK_MPS,
 // with the regions' reach as slack). Each sound follows at most one earlier sound: the latest that fits.
+// Several sweeps heard in one listening round count too: the Anchor gives each the moment it was heard.
 // Other kinds of sound (faint ones, a board's own buzzer) are never part of a path.
-const TRACK_S = 12, TRACK_MPS = 2.5, TRACK_MIN_M = 0.1;
+const TRACK_S = 12, TRACK_MPS = 2.5, TRACK_MIN_M = 0.1, TRACK_GAP_S = 0.15;   // sweeps one after another in a clip are this far apart at least
 function across(q, ux, uy) {  // how far the sound's 95% region reaches from its middle in the direction (ux, uy), metres
   const e = q.ellipse, c = Math.cos(e.angle_rad), si = Math.sin(e.angle_rad);
   const along = (ux * c + uy * si) / Math.max(e.major_m, 1e-3), across = (-ux * si + uy * c) / Math.max(e.minor_m, 1e-3);
@@ -518,18 +526,18 @@ function across(q, ux, uy) {  // how far the sound's 95% region reaches from its
 }
 function tracks(sources) {   // -> [{ from, to }], from the earlier sound to the later
   const placed = sources.filter(q => !q.far && kind(q) === 'sweep');   // sweeps only: other sounds are too loosely placed to call it movement
-  const out = [];
-  for (const to of placed) {
+  const out = [], left = new Set();   // left: sounds a path already leaves from; a path does not fork
+  for (const to of placed.slice().sort((a, b) => b.age_s - a.age_s)) {   // oldest first
     let best = null;
     for (const from of placed) {
       const gap = from.age_s - to.age_s;
-      if (kind(from) !== kind(to) || gap < 0.5 || gap > TRACK_S || (best && gap >= best.gap)) continue;
+      if (left.has(from) || gap < TRACK_GAP_S || gap > TRACK_S || (best && gap >= best.gap)) continue;
       const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy);
       if (d < TRACK_MIN_M) continue;
       const slack = across(from, dx / d, dy / d) + across(to, dx / d, dy / d);
       if (d > slack / 2 && d <= TRACK_MPS * gap + slack) best = { from, to, gap };
     }
-    if (best) out.push(best);
+    if (best) { out.push(best); left.add(best.from); }
   }
   return out;
 }
