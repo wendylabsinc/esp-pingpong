@@ -351,7 +351,7 @@ function drawPanels(s, misfit) {
         <button id="listen" ${s.ranging.running || asking === 'listen' ? 'disabled' : ''} title="The boards record two seconds without sweeping; a sound in that time is placed on the map">Listen once</button>
         <button id="keep" ${asking === 'keep' ? 'disabled' : ''} class="${s.ranging.keep_listening ? 'on' : ''}" title="Short listening rounds one after another: a sound played at any moment shows up within seconds">${s.ranging.keep_listening ? 'Listening… (stop)' : 'Keep listening'}</button>
         <button id="buzz" ${s.ranging.running || asking === 'buzz' ? 'disabled' : ''} title="Sounds the buzzer on the anchor's own board inside one listening round">Buzz the anchor</button>
-        <span class="dim num">Listening boards: ${s.ranging.rounds || 0} rounds started, ${s.ranging.solved || 0} gave distances.</span></p>` : '');
+        <span class="dim num">Listening boards: ${s.ranging.rounds || 0} rounds started, ${s.ranging.solved || 0} gave distances.${s.ranging.reports ? ` The boards themselves reported ${s.ranging.reports} sweeps heard; ${s.ranging.sweeps || 0} were heard by three and placed.` : ''}</span></p>` : '');
   const heard = (s.sources || []).filter(q => shows[kind(q)]).reverse();
   const real = s.truth ? s.truth.sounds : null;
   let q = `<table><tr><th>Heard</th><th>Where</th>${real ? '<th>Off by</th>' : ''}<th>95% within</th><th>From each board</th><th>Check</th></tr>`;

@@ -131,6 +131,55 @@ def place_heard(rid, groups):
 
 ranger.on_heard = place_heard
 
+run = {"later": [], "n": 0, "key": None, "last": 0.0, "newest": 0.0}
+
+def place_detected(group):
+    """One sweep that three or more boards found by themselves (sync-fw/main/sweepdet.c), placed at once.
+    Sweeps that keep arriving with the differences the run began with are one thing at one spot: placed as
+    one, from the middle of the last eight. Other differences, or three seconds of nothing, begin a new
+    point; that is how something moving leaves a point every time it has gone a few centimetres."""
+    first = min(group.values())
+    later = {b: v - first for b, v in group.items()}
+    same = (run["later"] and set(run["later"][0]) == set(later) and 0 <= first - run["last"] < 3e6
+            and all(abs(run["later"][0][b] - later[b]) < 150 for b in later))
+    if same:
+        run["later"] = [run["later"][0]] + (run["later"][1:] + [later])[-7:]
+        run["n"] += 1
+    else:
+        run.update(later=[later], n=1, key=f"heard-{int(first)}")
+    run["last"] = first
+    run["newest"] = max(run["newest"], first)
+    boards = sorted(later)
+    times = [float(np.median([k[b] for k in run["later"]])) for b in boards]
+    note = "sweep heard" + (f", {run['n']} times" if run["n"] > 1 else "")
+    got = locator.times(run["key"], boards, times, SOUND_SPEED, note=note, sigma_us=[20.0] * len(boards),
+                        at=time.time() - (run["newest"] - first) * 1e-6)
+    if run["n"] == 1 or run["n"] % 25 == 0:
+        print(f"boards report a sweep ({note}): "
+              + (f"placed at x {got['x']:+.3f} y {got['y']:+.3f} m" + (" (direction only)" if got["far"] else "")
+                 if "x" in got else f"not placed: {got['error']}"), flush=True)
+
+ranger.on_detected = place_detected
+held_reports = collections.deque(maxlen=60)   # reports that had no place on the shared timeline yet
+
+def heard_report(meta, pcm, placed):
+    """A board's report of a sweep it found (bands_hit HEARD_HIT): no audio, 20 ms of its matched filter."""
+    if not placed or "trigger_ref_esp_us" not in placed:
+        held_reports.append((time.monotonic(), meta, pcm))     # the reference board's beacons are not in yet
+        return
+    at, clear = ranging.heard_arrival(pcm)
+    ranger.detected(meta["node"], placed["trigger_ref_esp_us"] + (at - (meta["trigger_n"] - meta["first_n"])) * 1e6 / meta["rate"])
+    for _ in range(len(held_reports)):                         # one that waited may have its place now
+        came, m2, p2 = held_reports.popleft()
+        if time.monotonic() - came > 2:
+            continue
+        again = place(m2)[0]
+        if again and "trigger_ref_esp_us" in again:
+            a2, _ = ranging.heard_arrival(p2)
+            ranger.detected(m2["node"], again["trigger_ref_esp_us"] + (a2 - (m2["trigger_n"] - m2["first_n"])) * 1e6 / m2["rate"])
+        else:
+            held_reports.append((came, m2, p2))
+
 keep_listening = {"on": False, "thread": None}
 
 def listening(on):
@@ -591,6 +640,9 @@ def finish(key, salvage=False):
         completed[src] += 1
     try:
         placed, why = place(meta)
+        if ranging.is_report(meta["bands_hit"]):   # a board's own report of a sweep: no audio to keep, and too many to print
+            heard_report(meta, pcm, placed)
+            return
         stem = write(meta, pcm, placed)
         if meta["bands_hit"] & ranging.RANGE_HIT:
             # A ranging round's recording, not a sound to place, unless the boards only listened: then
@@ -757,6 +809,7 @@ def serve_files():
         POST /cmd?line=<dongle command>   allowlisted, e.g. line=gpio%206
         POST /listen?on=<1|0>             keep listening: sounds placed as they come
         POST /beep?board=<mac>            that board plays its sweep three times
+        POST /detect?on=<1|0>             the boards report sweeps they find themselves (on at boot)
                                           &t=<asker's clock, ms> on any POST: dropped when it arrives over 2 s
                                           (a beep) or 6 s (the rest) behind the usual trip
         POST /range?rounds=<n>            ranging rounds between the listening boards;
@@ -827,6 +880,12 @@ def serve_files():
                     return self.send_error(400, "command not allowed")
                 send_cmd(line)
                 return self._text(f"sent: {line}\n")
+            if u.path == "/detect":   # the boards' own sweep reports, on (the firmware's default) or off
+                on = q.get("on", ["1"])[0] == "1"
+                for board in ranger.live():
+                    send_cmd(f"nack {board} {ranging.DETECT_BOOT:08x} 0 {1 if on else 0}")
+                    time.sleep(0.05)
+                return self._text(f"sweep reports {'on' if on else 'off'}: {', '.join(ranger.live())}\n")
             if u.path == "/beep":     # one board plays its sweep three times: which one is this?
                 board = q.get("board", [""])[0].lower()
                 if not re.fullmatch(r"[0-9a-f]{12}", board):

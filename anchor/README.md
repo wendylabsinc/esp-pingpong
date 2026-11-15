@@ -328,6 +328,33 @@ above the room noise at the boards:
   `/mesh.json` it keeps fresh, for when the Anchor is reached through
   `wendy cloud tunnel` (a second or two per request).
 
+### The boards report sweeps themselves (2026-11-15)
+
+A listening round left the boards deaf three seconds in five, while its recordings were sent. Since the
+firmware of 2026-11-15 every board runs the sweep's matched filter itself, all the time
+(`sync-fw/main/sweepdet.c`: the samples halved to 16 kHz, matched 8000 times a second, about a quarter of
+one core), and tells the Anchor of each sweep it finds in a fragment of 1.6 KB: 20 ms of the filter's
+output around the strongest point, as complex numbers, with three seconds of beacons. Sent in about
+18 ms; the audio stays on the board. `ranging.heard_arrival` evens that output out over the band, fills
+it in eight times and picks the arrival by `find_sweep`'s rule; `Ranger.detected` gathers the reports
+of one sweep (within 15 ms on the shared timeline, waited for up to a second) and `place_detected` in
+`anchor.py` places it. Sweeps that keep arriving with the same differences are one point ("sweep heard,
+8 times"); other differences start a new point, which is what a path is drawn from.
+
+Measured: a clip with a sweep every 0.4 s played from a laptop for 12 s gave 80 reports from three
+boards, 22 sweeps placed, the laptop's place repeating to about 1 cm. `test_sweepdet.py` builds the
+detector for a laptop and feeds it made-up audio: arrival differences between boards right to 1 us,
+20 us for a sweep no louder than the noise, nothing reported on noise alone.
+
+- A board does not report during a ranging round (the sweeps are the boards' own), and sends no
+  one-second recording for a sound that turned out to be a sweep.
+- `POST /detect?on=0` switches the reports off on every board heard lately, `on=1` on again; on a
+  board's console, `detect 0` and `detect 1`. On at boot.
+- Sweeps in listening rounds are not placed a second time while reports are coming in.
+- The three boards run the build made before a one-line fix in `build_blob` (a round whose number has
+  bit 30 set was taken for a report). The Anchor keeps round numbers under that bit, so it does not
+  matter until someone starts rounds from elsewhere; the fix is in the source for the next build.
+
 ### Boards in shells (2026-11-15)
 
 With each board in a closed shell its own sweep is about fifty times louder at its own microphone

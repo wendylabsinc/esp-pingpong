@@ -33,6 +33,7 @@ from mesh import AGREE_MIN, KEEP, SELF_M, SPEED, agree
 RANGE_HIT = 0x80000000              # sync-fw proto.h
 RANGE_BOOT = 0x31474E52             # sync-fw proto.h: a round carried by the dongle's "nack" command
 BEEP_BOOT = 0x31504542              # sync-fw proto.h: "play your sweep this many times"
+DETECT_BOOT = 0x31544544    # "DET1": switch a board's own sweep reports on or off
 LEAD_MS = 250                       # from the first board being told to the start of the round
 SLOT_MS = 160                       # one sweep (64 ms), its echoes, and the next board's turn
 PRE_MS = 60                         # sync-fw RANGE_PRE_MS: recorded before slot 0
@@ -102,6 +103,41 @@ def _envelope(x, rate, up=4, flatten=True):
     full = np.zeros(n * up, complex)
     full[: len(cross)] = 2 * cross            # positive frequencies only: the envelope comes out as the magnitude
     return np.abs(np.fft.ifft(full))[: len(x) * up]
+
+
+HEARD_HIT = 0x40000000      # in bands_hit: a board's own report of a sweep it heard (sync-fw/main/sweepdet.c)
+HEARD_RATE = 8000           # values per second in such a report
+REPORT_WAIT_S = 1.0         # how long the reports of one sweep are waited for
+
+
+def is_report(bands_hit):
+    """A sweep report, not a round's recording whose number happens to have the same bit set."""
+    return bands_hit & (RANGE_HIT | HEARD_HIT) == HEARD_HIT
+
+
+def heard_arrival(iq, up=8):
+    """A board's own report of a sweep -> (where in the report the sweep arrived, in values, fractional;
+    how far it stands out of the usual level).
+
+    The board ran the matched filter itself and sent 20 ms of its output around the strongest point, as
+    complex numbers 8000 times a second, then its usual level. That output has the sweep's 2 to 6 kHz on
+    one side only, so 8000 a second holds all of it; here it is evened out over the band, filled in to
+    `up` times as many points, and the arrival is picked on its envelope by find_sweep's rule.
+    """
+    v = np.asarray(iq, float)
+    usual = max(float(v[-2]), 1.0)
+    c = v[:-2:2] + 1j * v[1:-2:2]
+    n = len(c)
+    spec = np.fft.fft(c)
+    hz = np.arange(n) * HEARD_RATE / n
+    spec[(hz < SWEEP[0] * 0.9) | (hz > SWEEP[1] * 1.1)] = 0
+    mag = np.abs(spec)
+    spec = spec / (mag + 0.05 * mag.max() + 1e-12)
+    full = np.zeros(n * up, complex)
+    full[:n] = spec
+    env = np.abs(np.fft.ifft(full))
+    k = _direct(env, 0, int(np.argmax(env)), HEARD_RATE * up)
+    return _fine(env, k) / up, 30000.0 / usual
 
 
 def _direct(env, lo, k, per_s):
@@ -341,6 +377,9 @@ class Ranger:
         self.on_solved = None                       # called after every round that was worked out
         self.on_sweeps = None                       # ... with {chirper: {board: when it heard that sweep}}
         self.on_heard = None                        # a listening round: [{board: when it heard a sweep from elsewhere}, ...]
+        self.on_detected = None                     # the boards' own reports of one sweep: {board: when it heard it}
+        self.reports = []                           # (when on the shared timeline, board, when it came in)
+        self.last_report = -1e9
         self.emits = collections.OrderedDict()      # (round, board) -> when its sweep began, on its own clock (its "G" line)
         self.paths = {}                             # (chirper, microphone's board) -> buzzer-to-microphone readings, mm
         self.geometry = None                        # solve_geometry()'s answer, once every path is settled
@@ -391,7 +430,9 @@ class Ranger:
         if listen:
             slot_ms = LISTEN_SLOT_MS
         with self.lock:
-            rid = self.last_round = max(int(time.time()) & 0x7FFFFFFF, self.last_round + 1)
+            # Round numbers stay under HEARD_HIT: the boards' firmware of 2026-11-15 takes a recording whose
+            # number has that bit set for a sweep report, and sends no audio for it.
+            rid = self.last_round = max(int(time.time()) & (HEARD_HIT - 1), self.last_round + 1) & (HEARD_HIT - 1)
             self.rounds[rid] = dict(order=order, slot_ms=slot_ms, at=time.monotonic(), recs={}, done=False, listen=listen)
             while len(self.rounds) > 16:
                 self.rounds.popitem(last=False)
@@ -490,8 +531,52 @@ class Ranger:
         self.stats["listened"] += 1
         self.log(f"round {rid}: listened, " + ", ".join(f"{b[-4:]} heard {len(v)}" for b, v in sorted(found.items()))
                  + f"; {len(groups)} sweeps heard by three or more boards")
-        if self.on_heard and groups:
-            self.on_heard(rid, groups)
+        if self.on_heard and groups and time.monotonic() - self.last_report > 15:   # boards that report sweeps themselves
+            self.on_heard(rid, groups)                                             # have told of these already
+
+    def detected(self, board, t_us, now=None):
+        """A board's own report of a sweep (HEARD_HIT), at t_us on the shared timeline. The reports of one
+        sweep come within 15 ms of each other (boards up to 5 m apart) and mostly within a tenth of a second
+        over the radio, a resent one later: once every board heard lately has told of it, or after REPORT_WAIT_S
+        with at least three, it goes to on_detected."""
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self.stats["reports"] += 1
+            self.last_report = now
+            self.reports.append((t_us, board, now))
+        self._gather(now)
+        threading.Timer(REPORT_WAIT_S + 0.05, self._gather).start()   # and once more when no further report can be expected
+
+    def _gather(self, now=None):
+        now = time.monotonic() if now is None else now
+        want = max(3, len(self.live(now)))
+        ready = []
+        with self.lock:
+            self.reports.sort()
+            groups, at = [], 0
+            while at < len(self.reports):
+                end = at
+                while end + 1 < len(self.reports) and self.reports[end + 1][0] - self.reports[at][0] < 15000:
+                    end += 1
+                groups.append(self.reports[at:end + 1])
+                at = end + 1
+            keep = []
+            for g in groups:
+                heard = {}
+                for t, board, _ in g:
+                    heard.setdefault(board, t)
+                waited = now - min(came for _, _, came in g)
+                if len(heard) >= want or (waited >= REPORT_WAIT_S and len(heard) >= 3):
+                    ready.append(heard)
+                    self.stats["sweeps"] += 1
+                elif waited < REPORT_WAIT_S:
+                    keep += g
+                else:
+                    self.stats["unheard"] += 1       # fewer than three boards told of it: no place for it
+            self.reports = keep
+        for heard in ready:
+            if self.on_detected:
+                self.on_detected(heard)
 
     def emitted(self, board, rid, esp_us):
         """A board's "G" line: when its sweep of round `rid` began, on its own clock (0: it played none)."""

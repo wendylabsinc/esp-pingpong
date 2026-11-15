@@ -50,6 +50,9 @@
 /* The same round through a dongle that only knows "nack": an SSN1 frame per
  * board whose boot id is this, frag_id the round, and the values slot_ms,
  * lead_ms, n, then each board's address as three u16. */
+#define HEARD_HIT 0x40000000u /* in bands_hit: not audio but this board's own report of a sweep it heard
+                               * (sweepdet.h): rate 8000, the samples are its pairs */
+#define DETECT_BOOT 0x31544544u /* "DET1" in a resend request's boot id: switch those reports on (1) or off (0) */
 #define RANGE_BOOT 0x31474e52u /* "RNG1" */
 /* "Beep": an SSN1 frame whose boot id is this; the first value is how many sweeps to play (1 to 5).
  * For telling the boards apart by ear: the Anchor's page sends it to the board that is clicked. */

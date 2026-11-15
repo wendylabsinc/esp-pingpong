@@ -74,7 +74,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send(404, b"not here\n")
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/range", "/listen", "/dchirp", "/beep"):
+        if path not in ("/range", "/listen", "/dchirp", "/beep", "/detect"):
             return self.send(404, b"not here\n")
         # The page gets its answer at once and the press goes on to the Anchor behind its back: the tunnel
         # holds about one request in twelve for many seconds, and a browser keeps only six requests open

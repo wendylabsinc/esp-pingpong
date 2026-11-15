@@ -22,6 +22,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "proto.h"
+#include "sweepdet.h"
 
 static void nlogf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -73,6 +74,15 @@ static volatile int s_print_levels;
  *     <floor dB x10 of band 0> */
 static volatile int s_trace;
 static uint32_t s_frag_id;
+/* Sweeps this board finds by itself (sweepdet.c), told to the Anchor as fragments of 0.7 KB in place of
+ * the audio: with those the boards hear sweeps all the time, where a listening round's recordings left
+ * them deaf for three seconds in five while they were sent. "detect 0" switches it off. */
+#define HITS 8
+static volatile int s_detect = 1;
+static sd_hit_t s_hits[HITS];
+static uint32_t s_hit_id[HITS];
+static uint32_t s_heard;
+static int64_t s_heard_n = -(int64_t)RATE * 10; /* sample at which the last sweep found began */
 static SemaphoreHandle_t s_sent;
 typedef struct { int64_t first, trig; uint32_t ns, hit, id; } job_t;
 static QueueHandle_t s_jobs;
@@ -109,7 +119,12 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     /* A round's recording goes out at half the sample rate: its sounds lie under 7 kHz, and sending
      * it is most of what a listening round takes (measured: three boards, 87 KB each, 4.6 s on the
      * air). Sample numbers in the fragment then count half-rate samples, block stamps included. */
-    int every = (hit & RANGE_HIT) ? 2 : 1;
+    /* A sweep report (HEARD_HIT) is not audio: its values come 8000 a second, so its numbers count
+     * every fourth sample. It carries the block stamps of the 200 ms before it too (the Anchor wants
+     * five to place it) and only three seconds of beacons: reports come often, and each beacon is 24
+     * bytes. */
+    int heard = (hit & (RANGE_HIT | HEARD_HIT)) == HEARD_HIT; /* a round's number may have that bit set too */
+    int every = heard ? 4 : (hit & RANGE_HIT) ? 2 : 1;
     if (every == 2 && (first_n & 1)) {
         first_n++;
         n_samples--;
@@ -119,12 +134,12 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     int ns = 0;
     for (int i = 0; i < STAMPS; i++) {
         const ssm_stamp_t *s = &s_stamps[i];
-        if (s->esp_us && s->n >= first_n - BLOCK && s->n < first_n + n_samples) {
+        if (s->esp_us && s->n >= first_n - BLOCK * (heard ? 10 : 1) && s->n < first_n + n_samples) {
             st[ns] = *s;
             st[ns++].n /= every; /* block starts are multiples of 640: no remainder */
         }
     }
-    uint32_t n_out = n_samples / every;
+    uint32_t n_out = heard ? 2 * SD_LEN + 2 : n_samples / every;
     /* beacons heard in the last 20 s */
     static ssm_beacon_t bc[BEACON_LOG];
     int nb = 0;
@@ -134,7 +149,7 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     uint32_t avail = total < BEACON_LOG ? total : BEACON_LOG;
     for (uint32_t k = 0; k < avail; k++) {
         const ssm_beacon_t *b = &g_beacon_log[(total - 1 - k) % BEACON_LOG];
-        if (now - b->esp_us > 20000000) break;
+        if (now - b->esp_us > (heard ? 3000000 : 20000000)) break;
         bc[nb++] = *b;
     }
     portEXIT_CRITICAL(&g_beacon_lock);
@@ -155,6 +170,16 @@ static size_t build_blob(uint8_t **out, uint32_t frag_id, int64_t first_n, uint3
     }
     memcpy(p, st, ns * sizeof(ssm_stamp_t)); p += ns * sizeof(ssm_stamp_t);
     memcpy(p, bc, nb * sizeof(ssm_beacon_t)); p += nb * sizeof(ssm_beacon_t);
+    if (heard) {
+        const sd_hit_t *sd = &s_hits[frag_id % HITS];
+        if (s_hit_id[frag_id % HITS] != frag_id) { /* overwritten while it waited: nothing true to send */
+            free(b);
+            return 0;
+        }
+        memcpy(p, sd->iq, n_out * 2);
+        *out = b;
+        return len;
+    }
     for (uint32_t i = 0; i < n_out; i++) {
         int64_t at = first_n + (int64_t)i * every;
         int16_t v = s_ring[at % RING];
@@ -363,6 +388,13 @@ void nack_received(const uint8_t *src, const uint8_t *data, int len)
         range_from_nack(frag, data + SSN_HDR, n);
         return;
     }
+    if (boot == DETECT_BOOT && n > 0 && n <= SSN_MAX && len == SSN_HDR + 2 * n + TAG_LEN && tag_ok(data, len)) {
+        uint16_t on;
+        memcpy(&on, data + SSN_HDR, 2);
+        s_detect = on ? 1 : 0;
+        nlogf("W,sweep reports %s\n", s_detect ? "on" : "off");
+        return;
+    }
     if (boot == BEEP_BOOT && n > 0 && n <= SSN_MAX && len == SSN_HDR + 2 * n + TAG_LEN && tag_ok(data, len)) {
         uint16_t times;
         memcpy(&times, data + SSN_HDR, 2);
@@ -429,8 +461,9 @@ static void flush_log(int outbox_n)
     int64_t now = esp_timer_get_time();
     if (now - last_beat > 10000000) {
         last_beat = now;
-        nlogf("H,up=%llds,outbox=%d,logdrop=%lu,psram_free=%u\n", (long long)(now / 1000000), outbox_n,
-              (unsigned long)s_nlog_dropped, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        nlogf("H,up=%llds,outbox=%d,logdrop=%lu,psram_free=%u,detect=%d,heard=%lu\n", (long long)(now / 1000000), outbox_n,
+              (unsigned long)s_nlog_dropped, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), s_detect,
+              (unsigned long)s_heard);
     }
     if (!anchor_fresh() || (now - last_flush < 500000 && s_nlog_len < NLOG_SIZE / 2)) return;
     static uint8_t blob[SSF_CHUNK];
@@ -495,7 +528,8 @@ static void sender_task(void *arg)
             continue;
         }
         int64_t until = box[head].ready_us + (int64_t)s_send_slot * SLOT_MS * 1000;
-        if (box[head].tries == 0 && s_send_slot > 0 && slot_waited != box[head].id && esp_timer_get_time() < until) {
+        if (box[head].tries == 0 && s_send_slot > 0 && slot_waited != box[head].id && esp_timer_get_time() < until &&
+            box[head].len > 4096 /* a sweep report is two pieces: it goes at once */) {
             /* A fresh fragment waits for this node's slot after it finished
              * recording, so nodes that heard the same sound do not all start
              * at once; a fragment that has already waited in the outbox goes
@@ -762,6 +796,21 @@ static void audio_task(void *arg)
         for (int i = 0; i < BLOCK; i++) s_ring[(n0 + i) % RING] = blk[i];
         s_n = n0 + BLOCK;
 
+        /* The sweep detector sees every block. What it finds during a ranging round is the boards' own
+         * sweeps, which the round's recording already holds, so that is not reported. */
+        if (s_detect) {
+            static sd_hit_t found;
+            if (sd_feed(blk, BLOCK, n0, &found) && !s_range_pending && now - s_round_done_us > 300000) {
+                uint32_t id = ++s_frag_id;
+                s_hits[id % HITS] = found;
+                s_hit_id[id % HITS] = id;
+                s_heard++;
+                s_heard_n = (found.first + SD_PRE) * 4;
+                job_t j = {.first = found.first * 4, .trig = (found.first + SD_PRE) * 4, .ns = SD_LEN * 4, .hit = HEARD_HIT, .id = id};
+                if (xQueueSend(s_jobs, &j, 0) != pdTRUE) nlogf("W,sender busy, sweep report %lu dropped\n", (unsigned long)id);
+            }
+        }
+
         /* bands */
         uint32_t over = 0;
         for (int b = 0; b < s_nbands; b++) {
@@ -847,7 +896,8 @@ static void audio_task(void *arg)
             }
         }
         if (s_enabled && onset && n0 - last_trig >= (int64_t)RETRIGGER_MS * RATE / 1000 && now - s_round_done_us > ROUND_QUIET_US &&
-            s_outbox_n < 2 /* a sound every few hundred ms filled the outbox and dropped fragments: no new one while two wait */) {
+            s_outbox_n < 2 /* a sound every few hundred ms filled the outbox and dropped fragments: no new one while two wait */ &&
+            n0 - s_heard_n > (int64_t)RATE * 3 / 2 /* sweeps are being reported: their audio would only hold those reports up */) {
             if (npend < MAX_PENDING) {
                 pend_n[npend] = n0;
                 pend_hit[npend] = over;
@@ -865,8 +915,12 @@ static void audio_task(void *arg)
             if (first < 0) first = 0;
             uint32_t ns = (uint32_t)(s_n - first);
             if (ns > RING - BLOCK * 4) ns = RING - BLOCK * 4;
-            job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = pend_hit[0], .id = ++s_frag_id};
-            if (xQueueSend(s_jobs, &j, 0) != pdTRUE) nlogf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
+            if (s_heard_n > trig_n - (int64_t)RATE * 3 / 10) {
+                /* what set the trigger off was a sweep, found while this recording ran: the report is enough */
+            } else {
+                job_t j = {.first = first, .trig = trig_n, .ns = ns, .hit = pend_hit[0], .id = ++s_frag_id};
+                if (xQueueSend(s_jobs, &j, 0) != pdTRUE) nlogf("W,sender busy, fragment %lu dropped\n", (unsigned long)j.id);
+            }
             for (int i = 1; i < npend; i++) {
                 pend_n[i - 1] = pend_n[i];
                 pend_hit[i - 1] = pend_hit[i];
@@ -962,6 +1016,11 @@ static void beep_task(void *arg)
 int audio_command(const char *line)
 {
     int bp, bh = 4000, bc = 20;
+    if (sscanf(line, "detect %d", &bp) == 1) { /* sweep reports on (1) or off (0) */
+        s_detect = bp ? 1 : 0;
+        printf("OK detect=%d heard=%lu\n", s_detect, (unsigned long)s_heard);
+        return 1;
+    }
     if (sscanf(line, "beeppin %d", &bp) == 1) {
         gpio_config_t c = {.pin_bit_mask = 1ULL << bp, .mode = GPIO_MODE_OUTPUT};
         gpio_config(&c);
@@ -1037,6 +1096,7 @@ void audio_start(void)
     s_prev_vprintf = esp_log_set_vprintf(nlog_vprintf);
     nlogf("B,boot=%08lx,reset=%s\n", (unsigned long)g_boot_id, reset_name(esp_reset_reason()));
     s_ring = heap_caps_calloc(RING, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    sd_init();
     s_sent = xSemaphoreCreateBinary();
     esp_now_register_send_cb(send_cb);
     /* Defaults that work without a laptop: the base station's code reaches
