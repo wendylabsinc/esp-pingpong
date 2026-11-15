@@ -74,7 +74,9 @@
       Dotted lines join the anchor to the boards its radio hears; it measures no distance to them.
       Sound gives distances only, so the picture may be turned or mirrored against the room.
       A sound heard by three or more boards is drawn where its arrival times put it, with the region it is
-      95% likely to be in; a ray means only its direction is known.</p>
+      95% likely to be in. An orange arrow joins two heard sweeps when the second came within
+      12 seconds, somewhere else, and near enough to have been walked: something that moved. The band around
+      the arrow is where its path could lie, as wide at each end as that sound's region, strongest in the middle.</p>
   </section>
   <aside>
     <section><h2>Sounds</h2>
@@ -257,22 +259,39 @@ function drawMap(s) {
     h += `<circle cx="${drag.sx}" cy="${drag.sy}" r="8" fill="var(--accent)" stroke="var(--panel)" stroke-width="2"/>`
        + `<text x="${drag.sx}" y="${drag.sy + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(held))}</text>`;
   }
+  // Movement: a line from where a sound was to where the same kind of sound came next (tracks()). It lives
+  // and fades with its later end; the earlier end may have faded from the map by then.
+  for (const t of tracks((s.sources || []).filter(q => shows[kind(q)]))) {
+    if (!heard.includes(t.to)) continue;
+    const fade = s.demo ? (t.to === heard[heard.length - 1] ? 1 : .45) : Math.max(0, 1 - age(t.to) / FADE_S);
+    const x1 = PX(t.from.x, t.from.y), y1 = PY(t.from.x, t.from.y), x2 = PX(t.to.x, t.to.y), y2 = PY(t.to.x, t.to.y);
+    const len = Math.hypot(x2 - x1, y2 - y1) || 1, ux = (x2 - x1) / len, uy = (y2 - y1) / len;
+    const tipx = x2 - 9 * ux, tipy = y2 - 9 * uy;   // the arrow stops short of the later sound's cross
+    const metresMoved = Math.hypot(t.to.x - t.from.x, t.to.y - t.from.y);
+    // The band the path could lie in: as wide at each end as that sound's 95% region is across the line
+    // (across()), narrowing or widening evenly in between. Drawn as layers, each narrower than the last, so it
+    // is strongest along the line and thins out to nothing at the region's edge.
+    const mdx = (t.to.x - t.from.x) / metresMoved, mdy = (t.to.y - t.from.y) / metresMoved;   // along the path, on the map
+    const w1 = across(t.from, -mdy, mdx) * k, w2 = across(t.to, -mdy, mdx) * k;                   // half-widths, pixels
+    let band = '';
+    for (const f of [1, .82, .64, .48, .32, .18])
+      band += `<path d="M${x1 - uy * w1 * f} ${y1 + ux * w1 * f}L${x2 - uy * w2 * f} ${y2 + ux * w2 * f}L${x2 + uy * w2 * f} ${y2 - ux * w2 * f}L${x1 + uy * w1 * f} ${y1 - ux * w1 * f}Z" fill="var(--sound)" fill-opacity=".07"/>`;
+    h += `<g opacity="${fade}"><title>Moved ${metresMoved.toFixed(2)} m in ${t.gap.toFixed(0)} s (${(metresMoved / t.gap).toFixed(1)} m/s); the band is where the path could lie</title>`
+       + band + `<line x1="${x1}" y1="${y1}" x2="${tipx}" y2="${tipy}" stroke="var(--sound)" stroke-width="2.5" stroke-linecap="round"/>`
+       + (len > 24 ? `<path d="M${tipx} ${tipy}L${tipx - 9 * ux + 5 * uy} ${tipy - 9 * uy - 5 * ux}L${tipx - 9 * ux - 5 * uy} ${tipy - 9 * uy + 5 * ux}Z" fill="var(--sound)"/>` : '')
+       + '</g>';
+  }
   heard.forEach((q, i) => {  // oldest first, so the newest is drawn on top and strongest
     // A buzzer placed from a ranging round (it has a note) stays fully drawn: it is a standing check of the map.
     const newest = i === heard.length - 1;
     const fade = !s.demo ? Math.max(0, 1 - age(q) / FADE_S) : newest || (q.note || '').startsWith('buzzer') ? 1 : Math.max(0.12, 0.5 - 0.08 * (heard.length - 2 - i));
     const what = `${q.note ? q.note[0].toUpperCase() + q.note.slice(1) : 'Sound'} ${q.age_s.toFixed(0)} s ago: ${q.boards.map(b => `${named(b.node)} ${metres(b.distance_mm)}`).join(', ')}`;
     h += `<g opacity="${fade}"><title>${esc(what)}</title>`;
-    if (q.far) {  // a direction and hardly a distance: a ray from the middle of the boards
-      const far = 700, bx = Math.cos(drawn(q.bearing_rad)), by = Math.sin(drawn(q.bearing_rad));
-      h += `<line x1="${PX(cx, cy)}" y1="${PY(cx, cy)}" x2="${PX(cx, cy) + far * bx}" y2="${PY(cx, cy) - far * by}" stroke="var(--sound)" stroke-width="2" stroke-dasharray="8 6"/>`;
-    } else {
+    if (!q.far) {  // a sound with a direction and hardly a distance is in the table only: its ray across the map said little
       const x = PX(q.x, q.y), y = PY(q.x, q.y), e = q.ellipse;
       h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`
          + `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`;
       if (newest) {
-        for (const b of q.boards) if (pos[b.node])
-          h += `<line x1="${x}" y1="${y}" x2="${X(b.node)}" y2="${Y(b.node)}" stroke="var(--sound)" stroke-dasharray="3 4" opacity=".7"/>`;
         if (q.alt) h += `<circle cx="${PX(q.alt.x, q.alt.y)}" cy="${PY(q.alt.x, q.alt.y)}" r="5" fill="none" stroke="var(--sound)" stroke-dasharray="2 2"><title>These arrival times fit this spot as well</title></circle>`;
         h += `<text x="${x}" y="${y - 12}" text-anchor="middle" font-weight="600" fill="var(--sound)">${esc(said(q))}</text>`;
       } else if (q.note) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;
@@ -486,6 +505,34 @@ function demoBar(s) {  // how many boards there are, and no more than a ranging 
 
 let timer = null;
 const FADE_S = 10;
+// Movement. Two sweeps heard in listening rounds are taken as one thing that moved when the later one came within
+// TRACK_S seconds, far enough from the earlier one to be a different place (more than half of what the two
+// 95% regions reach towards each other, and TRACK_MIN_M), and near enough to have been walked (TRACK_MPS,
+// with the regions' reach as slack). Each sound follows at most one earlier sound: the latest that fits.
+// Other kinds of sound (faint ones, a board's own buzzer) are never part of a path.
+const TRACK_S = 12, TRACK_MPS = 2.5, TRACK_MIN_M = 0.1;
+function across(q, ux, uy) {  // how far the sound's 95% region reaches from its middle in the direction (ux, uy), metres
+  const e = q.ellipse, c = Math.cos(e.angle_rad), si = Math.sin(e.angle_rad);
+  const along = (ux * c + uy * si) / Math.max(e.major_m, 1e-3), across = (-ux * si + uy * c) / Math.max(e.minor_m, 1e-3);
+  return 1 / Math.hypot(along, across);
+}
+function tracks(sources) {   // -> [{ from, to }], from the earlier sound to the later
+  const placed = sources.filter(q => !q.far && kind(q) === 'sweep');   // sweeps only: other sounds are too loosely placed to call it movement
+  const out = [];
+  for (const to of placed) {
+    let best = null;
+    for (const from of placed) {
+      const gap = from.age_s - to.age_s;
+      if (kind(from) !== kind(to) || gap < 0.5 || gap > TRACK_S || (best && gap >= best.gap)) continue;
+      const dx = to.x - from.x, dy = to.y - from.y, d = Math.hypot(dx, dy);
+      if (d < TRACK_MIN_M) continue;
+      const slack = across(from, dx / d, dy / d) + across(to, dx / d, dy / d);
+      if (d > slack / 2 && d <= TRACK_MPS * gap + slack) best = { from, to, gap };
+    }
+    if (best) out.push(best);
+  }
+  return out;
+}
 const seen = {};   // a placed sound -> when this page first saw it (ms) and how old it said it was
 function age(q) {
   const key = `${q.event}:${q.x}:${q.y}`;

@@ -298,6 +298,16 @@ above the room noise at the boards:
   showed 22 to 32 dB over the room at all three boards and was placed at the
   same spot on two tries, 38 cm from one board and 41 cm from another, with a
   phone playing sweeps in the room at the same time.
+- **Movement**: an orange arrow joins two heard sweeps when the second came
+  within 12 seconds, at a different place (further apart than half of what the
+  two 95% regions reach towards each other, and 10 cm), and near enough to have
+  been walked (2.5 m/s, with the regions' reach as slack): `tracks()` in
+  `mesh.html`. The band around the arrow is where the path could lie: as wide
+  at each end as that sweep's region is across the line, strongest along the
+  line. Other kinds of sound get no arrow. This is drawn by the page from two
+  placed sounds; the Anchor does no tracking. The dotted orange lines (a ray for
+  a sound with a direction only, and lines from the newest sound to each board)
+  are gone: a sound without a place is listed in the table only.
 - **Turn left, Turn right, Mirror** (and Shift with scroll): turn or mirror the
   picture so it matches the room as you stand in it. Distances alone fix the
   boards' shape but not which way it faces, nor whether it is mirrored. This
