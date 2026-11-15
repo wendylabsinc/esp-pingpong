@@ -62,6 +62,43 @@ holds the component sources and the patches to apply. Local copies: worktree
    the sender address; needs nodes and dongle reflashed together), and a local
    WendyOS fix for the gpio entitlement (`fix/gpio-entitlement-all-chips`).
 
+## Sound location (branch `locate`, run on three boards 2026-11-14)
+
+See `anchor/README.md`, "Where a sound came from" and "Distances between the
+listening boards". State at the end of the evening:
+
+- Three XIAOs (`4824`, `4e58`, `4ff8`) run `sync-fw` from this branch in slot
+  `ota_0`; `4824` and `4ff8` still hold the `pingpong_range` firmware in
+  `ota_1` (write the saved `otadata` back to boot it). The dongle runs this
+  branch's firmware and is on the Dragonwing's USB hub. The Anchor on the
+  Dragonwing is this branch's `anchor/`.
+- The mesh page shows the three boards (662, 832 and 1154 mm apart), each
+  board's buzzer placed next to it, and sweeps from the Mac's speakers placed
+  in listening rounds. From a laptop: `wendy cloud tunnel 8091:8091 --device
+  iq9` (a CLI built from current WendyOS source), then
+  `http://localhost:8091/mesh#<token>`.
+
+To repeat: "Measure distances now" on the page until three distances are
+settled, then "Listen for a sweep" while something plays 2 to 6 kHz sweeps
+(`locate.py wav sweep`).
+
+Left to do:
+
+1. **Tape the boards.** Nothing here has been compared with a ruler. The
+   10 to 14 cm hump ambiguity in every arrival is the error to settle first.
+2. **Buzzers next to their microphones.** With the piezo on a wire the two
+   directions of a pair differ by up to 20 cm and the longer one is only a
+   lower bound made good. Taped to the board, the two directions should agree
+   and the map tighten.
+3. **A fourth board** makes both the map and every placed sound checkable
+   (three boards leave no spare measurement).
+4. **Ordinary sounds.** Placing from a triggered event's audio (`locate()`)
+   failed on the one real try; listening rounds work because the sound is a
+   known sweep. A sweep-shaped trigger on the boards, or a longer listen,
+   would close that gap.
+5. Fast loop for all of this: run `anchor.py` on a laptop with the dongle on
+   its USB; each try takes seconds.
+
 ## Security limits found in review (not fixed)
 
 A read-only review of the radio-facing code found no memory-safety bug in

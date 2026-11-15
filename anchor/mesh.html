@@ -2,11 +2,11 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mesh distances</title>
+<title>Mesh distances and sounds</title>
 <style>
-  :root { --bg:#f5f5f7; --panel:#fff; --line:#d1d1d6; --text:#1d1d1f; --dim:#6e6e73; --accent:#0071e3; --bad:#d70015; }
+  :root { --bg:#f5f5f7; --panel:#fff; --line:#d1d1d6; --text:#1d1d1f; --dim:#6e6e73; --accent:#0071e3; --bad:#d70015; --sound:#c93400; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#1d1d1f; --panel:#2d2d2f; --line:#48484a; --text:#f5f5f7; --dim:#a1a1a6; --accent:#4aa3ff; --bad:#ff6961; }
+    :root { --bg:#1d1d1f; --panel:#2d2d2f; --line:#48484a; --text:#f5f5f7; --dim:#a1a1a6; --accent:#4aa3ff; --bad:#ff6961; --sound:#ffb340; }
   }
   body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; }
   h1 { font-size:18px; margin:0 0 12px; }
@@ -23,18 +23,68 @@
   .dim { color:var(--dim); } .bad { color:var(--bad); }
   .num { font-variant-numeric:tabular-nums; }
   .scroll { overflow-x:auto; }
+  .chip { display:inline-block; width:.8em; height:.8em; border-radius:50%; vertical-align:-.05em; border:1px solid var(--line); }
+  button { font:inherit; padding:4px 10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--text); cursor:pointer; }
+  button:disabled { color:var(--dim); cursor:default; }
+  #kinds { margin:0 0 8px; color:var(--dim); }
+  #zoomer { margin:8px 0 0; }
+  #zoomer button { padding:2px 11px; min-width:2.2em; }
+  #map { touch-action:none; }
+  #kinds button { padding:2px 9px; }
+  #demo { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; margin:10px 0 4px; }
+  #demo[hidden] { display:none; }
+  #demo .grow { flex:1 1 0; }
+  .tools { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .tools button { border:0; border-radius:0; border-left:1px solid var(--line); background:transparent; }
+  .tools button:first-child { border-left:0; }
+  .tools button.on { background:var(--accent); color:#fff; font-weight:600; }
+  #note { flex:1 1 100%; min-height:1.45em; margin:0; }
+  svg.live { cursor:crosshair; touch-action:none; user-select:none; -webkit-user-select:none; }
 </style>
 <h1>Mesh distances <span id="status" class="bad"></span></h1>
 <main>
   <section id="mapbox">
     <h2>Boards and the distances between them</h2>
     <svg id="map" viewBox="0 0 640 480" role="img" aria-label="Boards and the measured distances between them"></svg>
+    <p id="zoomer"><span class="tools" role="group" aria-label="Zoom">
+      <button id="zout" title="Zoom out">−</button><button id="zfit" title="Fit everything again">Fit</button><button id="zin" title="Zoom in">+</button>
+    </span> <span class="tools" role="group" aria-label="Turn the picture">
+      <button id="rleft" title="Turn the picture 15° left (Shift and scroll turns it too)">Turn left</button><button id="rzero" title="Back to how the Anchor drew it: not turned, not mirrored">0°</button><button id="rright" title="Turn the picture 15° right">Turn right</button><button id="rflip" title="Mirror the picture. Distances alone cannot tell a room from its mirror image, so the map may come out flipped">Mirror</button>
+    </span> <span class="dim">Scroll over the map to zoom, drag it to move. Turning and mirroring change the picture only.</span></p>
+    <div id="demo" hidden>
+      <span>Click the map to add a sound</span>
+      <span class="tools" role="group" aria-label="Kind of sound a click adds">
+        <button data-tool="sweep" class="on" title="A sweep from 2 to 6 kHz, as the boards' own buzzers play">Sweep</button>
+        <button data-tool="chord" title="Four pitches at once">Chord</button>
+        <button data-tool="click" title="A short click">Click</button>
+        <button data-tool="tone" title="A steady 2.7 kHz tone, the hard one to place">Tone</button>
+      </span>
+      <span>or a</span>
+      <span class="tools"><button data-tool="board" id="addboard" title="A new board">Board</button></span>
+      <span class="grow"></span>
+      <button id="clear" title="Remove the sounds from the map">Clear sounds</button>
+      <button id="reset" title="Back to the four boards the demo starts with">Reset</button>
+      <p id="note" class="num dim" role="status"></p>
+    </div>
+    <p id="demohelp" class="dim" hidden>Drag a board to move it, double-click it to remove it; Esc lets go of a drag. A dashed ring is
+      where a board or a sound really is. Dots, crosses and distances are what the Anchor worked out from simulated microphone
+      audio alone, so a board that was just added or moved has only its ring until three ranging rounds agree on its distances.</p>
     <p class="dim">A solid line is a distance that at least three recent rounds agree on, and those lines are drawn to scale.
       A dashed line is the best guess so far. A faded line has had no new round for 30 seconds.
       Dotted lines join the anchor to the boards its radio hears; it measures no distance to them.
-      Sound gives distances only, so the picture may be turned or mirrored against the room.</p>
+      Sound gives distances only, so the picture may be turned or mirrored against the room.
+      A sound heard by three or more boards is drawn where its arrival times put it, with the region it is
+      95% likely to be in; a ray means only its direction is known.</p>
   </section>
   <aside>
+    <section><h2>Sounds</h2>
+      <p id="kinds">Show <span class="tools" role="group" aria-label="Kinds of sound shown">
+        <button data-kind="sound" title="A sound with a clear start, placed from that start">Sound</button>
+        <button data-kind="faint" title="A sound with no clear start, placed by lining up the boards' whole recordings">Faint</button>
+        <button data-kind="sweep" title="A 2 to 6 kHz sweep found in a listening round">Sweeps</button>
+        <button data-kind="buzzer" title="The boards' own buzzers, placed in every ranging round">Board buzzers</button>
+      </span></p>
+      <div id="sounds" class="scroll"></div></section>
     <section><h2>Distances</h2><div id="edges" class="scroll"></div></section>
     <section><h2>Boards</h2><div id="nodes" class="scroll"></div></section>
   </aside>
@@ -43,60 +93,226 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const short = id => id.slice(-4);
+// Which kinds of placed sound are shown, on the map and in the list; remembered in this browser.
+const shows = { sound: true, faint: true, sweep: true, buzzer: true };
+try { Object.assign(shows, JSON.parse(localStorage.getItem('mesh.shows') || '{}')); } catch (e) { /* private window: not remembered */ }
+const kind = q => /^buzzer/.test(q.note || '') ? 'buzzer' : /^sweep/.test(q.note || '') ? 'sweep' : /^faint/.test(q.note || '') ? 'faint' : 'sound';
+for (const b of document.querySelectorAll('#kinds button')) {
+  b.classList.toggle('on', shows[b.dataset.kind]);
+  b.onclick = () => {
+    shows[b.dataset.kind] = !shows[b.dataset.kind];
+    b.classList.toggle('on', shows[b.dataset.kind]);
+    try { localStorage.setItem('mesh.shows', JSON.stringify(shows)); } catch (e) { /* as above */ }
+  };
+}
+// A board is known by its colour, which the Anchor hands out and the board's own LED blinks as a
+// count (red once, green twice, blue three times, ...): the address means nothing to anyone.
+const HUES = [['red', '#ff3b30'], ['green', '#34c759'], ['blue', '#0a84ff'], ['yellow', '#ffd60a'],
+              ['purple', '#bf5af2'], ['cyan', '#64d2ff'], ['orange', '#ff9f0a'], ['white', '#f2f2f7']];
+const colours = {};  // board -> colour number, from the last answer
+const hue = id => (HUES[colours[id] % HUES.length] || ['grey', 'var(--dim)']);
+const chip = id => id in colours ? `<span class="chip" style="background:${hue(id)[1]}" title="${esc(id)}"></span>` : esc(short(id));
+const named = id => id in colours ? hue(id)[0] : short(id);
+const said = q => {  // what a placed sound is called: the Anchor's note, with a board's address turned into its colour
+  const of = /^buzzer of ([0-9a-f]{4})$/.exec(q.note || '');
+  const id = of && Object.keys(colours).find(k => k.endsWith(of[1]));
+  return id ? `${hue(id)[0]}'s buzzer` : q.note || 'sound';
+};
 const metres = mm => (mm / 1000).toFixed(2) + ' m';
 const pos = {};  // board -> [x, y] in metres, kept between polls so the picture does not jump
 const gap = e => Math.hypot(pos[e.b][0] - pos[e.a][0], pos[e.b][1] - pos[e.a][1]);
+let last = null;   // the state last drawn
+let view = null;   // how the map is drawn: its middle in metres and pixels per metre
+let zoom = 1;      // live: how much closer than "everything fits"
+let pan = [0, 0];  // live: how far the middle is moved, in metres
+let turn = 0;      // live: the picture turned by hand, radians, anticlockwise. The picture only: the map,
+let flip = false;  // the coordinates in the tables and what the Anchor saves stay as they are. flip: mirrored.
+try { const t = JSON.parse(localStorage.getItem('mesh.turn') || '{}'); turn = +t.turn || 0; flip = !!t.flip; } catch (e) { /* private window: not remembered */ }
+let grab = null;   // live: a drag of the map itself
+let drag = null;   // demo: a press on the map, and the board under it if there was one
+let tool = 'sweep';  // demo: what a click on the map adds
+let hover = null;    // demo: the board under the pointer
 
 // ponytail: springs pulling from wherever the boards were last drawn. Four or more
 // boards can settle folded over; the fit shown under the table says when. Start
 // from classical scaling (layout() in box/taploc.py) if that turns up.
+// Live: until the Anchor has a map the boards sit grouped in the middle, with no lines between them;
+// when the map comes they spread out to their places, and "Measure again" brings them back first.
+const goal = {};   // board -> where it belongs, in metres
+let moving = null; // the timer that moves the dots there, a frame at a time
+function settle() {
+  let off = 0;
+  for (const id in goal) {
+    const p = pos[id], g = goal[id];
+    if (!p) continue;
+    p[0] += 0.16 * (g[0] - p[0]); p[1] += 0.16 * (g[1] - p[1]);
+    off = Math.max(off, Math.hypot(g[0] - p[0], g[1] - p[1]));
+  }
+  if (off < 0.002) {
+    for (const id in goal) if (pos[id]) pos[id] = goal[id].slice();
+    clearInterval(moving); moving = null;
+  }
+  if (last) drawMap(last);
+}
+function placeLive(s) {
+  const mapped = s.layout ? s.layout.nodes : null, on = mapped ? Object.values(mapped) : [];
+  const mid = on.length ? [on.reduce((a, p) => a + p[0], 0) / on.length, on.reduce((a, p) => a + p[1], 0) / on.length] : [0, 0];
+  for (const id in pos) if (!s.nodes.some(n => n.id === id)) { delete pos[id]; delete goal[id]; }
+  s.nodes.forEach((n, i) => {
+    const turn = 2 * Math.PI * i / Math.max(1, s.nodes.length) + 0.5;
+    const home = [mid[0] + 0.06 * Math.cos(turn), mid[1] + 0.06 * Math.sin(turn)];   // grouped in the middle
+    goal[n.id] = mapped && mapped[n.id] ? [mapped[n.id][0], mapped[n.id][1]] : home;
+    pos[n.id] ||= home.slice();
+  });
+  const off = Math.max(0, ...Object.keys(goal).map(id => Math.hypot(goal[id][0] - pos[id][0], goal[id][1] - pos[id][1])));
+  if (off > 0.002 && !moving) moving = setInterval(settle, 33);
+  return s.layout && s.layout.misfit_mm != null ? s.layout.misfit_mm / 1000 : null;
+}
+
 function place(s) {
+  if (!s.truth) return placeLive(s);
   s.nodes.forEach((n, i) => pos[n.id] ||= [0.5 * (i + 1) * Math.cos(2.4 * i), 0.5 * (i + 1) * Math.sin(2.4 * i)]);
   for (const id in pos) if (!s.nodes.some(n => n.id === id)) delete pos[id];
+  // Boards on the Anchor's own map (locate.py) stay where it puts them: the sounds are in its coordinates.
+  const pinned = s.layout ? s.layout.nodes : {};
+  for (const id in pinned) if (pos[id]) pos[id] = [pinned[id][0], pinned[id][1]];
   const springs = s.edges.filter(e => e.settled);
   for (let pass = 0; pass < 300; pass++)
     for (const e of springs) {
       const p = pos[e.a], q = pos[e.b], dx = q[0] - p[0], dy = q[1] - p[1], now = Math.hypot(dx, dy) || 1e-9;
-      const push = 0.25 * (now - e.mm / 1000) / now;
-      p[0] += push * dx; p[1] += push * dy; q[0] -= push * dx; q[1] -= push * dy;
+      const fp = e.a in pinned, fq = e.b in pinned;
+      if (fp && fq) continue;
+      const push = (fp || fq ? 0.5 : 0.25) * (now - e.mm / 1000) / now;
+      if (!fp) { p[0] += push * dx; p[1] += push * dy; }
+      if (!fq) { q[0] -= push * dx; q[1] -= push * dy; }
     }
   return springs.length > 2 ? Math.sqrt(springs.reduce((sum, e) => sum + (gap(e) - e.mm / 1000) ** 2, 0) / springs.length) : null;
 }
 
 function drawMap(s) {
-  const at = Object.values(pos);
-  if (!at.length) {
+  const real = s.truth || { nodes: {}, sounds: {} };  // demo only: where things really are, on this map
+  // Demo: a board the Anchor has not mapped yet has no dot of its own, only the ring where it really is.
+  const shown = id => !s.truth || !!(s.layout && s.layout.nodes[id]);
+  const at = Object.keys(pos).filter(shown).map(id => !s.truth && goal[id] ? goal[id] : pos[id]);
+  if (!at.length && !Object.keys(real.nodes).length) {
     $('map').innerHTML = `<text x="320" y="240" text-anchor="middle" fill="var(--dim)">${s.anchor ? 'The anchor hears no boards on the radio yet.' : 'Nothing from the anchor\'s dongle yet.'}</text>`;
     return;
   }
-  const cx = at.reduce((a, p) => a + p[0], 0) / at.length, cy = at.reduce((a, p) => a + p[1], 0) / at.length;
-  const reach = Math.max(0.25, ...at.map(p => Math.hypot(p[0] - cx, p[1] - cy))) * 1.5;
-  const k = 200 / reach, X = id => 320 + (pos[id][0] - cx) * k, Y = id => 240 - (pos[id][1] - cy) * k;
+  const all = at.concat(Object.values(real.nodes));
+  const mx = all.reduce((a, p) => a + p[0], 0) / all.length, my = all.reduce((a, p) => a + p[1], 0) / all.length;
+  const span = Math.max(0.25, ...all.map(p => Math.hypot(p[0] - mx, p[1] - my)));
+  // Room for the sounds that have a place, up to twice the boards' own spread.
+  const placed = (s.sources || []).filter(q => !q.far).map(q => [q.x, q.y]).concat(Object.values(real.sounds));
+  const sounds = placed.map(p => Math.hypot(p[0] - mx, p[1] - my));
+  const reach = Math.min(Math.max(span, ...sounds), 2 * span) * 1.5;
+  // Demo: the map stays as it is drawn while everything still fits, so what was clicked stays under the pointer.
+  const fits = s.truth && view && all.concat(placed.filter((p, i) => sounds[i] <= 2 * span))
+    .every(p => Math.abs((p[0] - view.cx) * view.k) < 300 && Math.abs((p[1] - view.cy) * view.k) < 215);
+  if (!fits && !(drag && view)) view = { cx: mx, cy: my, k: 200 / reach };  // also held still while the mouse is down
+  if (!s.truth) view = { cx: mx + pan[0], cy: my + pan[1], k: 200 / reach * zoom };  // live: what fits, zoomed and moved by hand
+  // Live: the picture is turned about its middle and mirrored left to right as set by hand (the demo is not).
+  const co = s.truth ? 1 : Math.cos(turn), si = s.truth ? 0 : Math.sin(turn), mi = !s.truth && flip ? -1 : 1;
+  const { cx, cy, k } = view;
+  const PX = (x, y) => 320 + mi * ((x - cx) * co - (y - cy) * si) * k, PY = (x, y) => 240 - ((x - cx) * si + (y - cy) * co) * k;
+  const drawn = a => { const b = a + (s.truth ? 0 : turn); return mi < 0 ? Math.PI - b : b; };  // a direction on the map, as it is drawn
+  const X = id => PX(pos[id][0], pos[id][1]), Y = id => PY(pos[id][0], pos[id][1]);
   const bar = [10, 5, 1, 0.5, 0.1].find(m => m * k <= 200) || 0.1;
   let h = `<path d="M16 462v6h${bar * k}v-6" fill="none" stroke="var(--dim)"/><text x="${16 + bar * k / 2}" y="458" text-anchor="middle" fill="var(--dim)">${bar} m</text>`;
   if (s.anchor) {  // it hears the boards by radio; it has no distance to them
     for (const n of s.nodes)
-      if (n.live) h += `<line x1="${X(n.id)}" y1="${Y(n.id)}" x2="600" y2="44" stroke="var(--dim)" stroke-dasharray="2 6" opacity=".6"/>`;
+      if (n.live && shown(n.id)) h += `<line x1="${X(n.id)}" y1="${Y(n.id)}" x2="600" y2="44" stroke="var(--dim)" stroke-dasharray="2 6" opacity=".6"/>`;
     h += `<rect x="588" y="32" width="24" height="24" rx="4" fill="var(--dim)"><title>${esc(s.anchor.id)}, channel ${esc(s.anchor.channel)}</title></rect>`
        + `<text x="600" y="24" text-anchor="middle" font-weight="600" fill="var(--text)">anchor ${esc(short(s.anchor.id))}</text>`;
   }
-  for (const e of s.edges) {  // labels sit off the middle, where crossing lines would stack them
+  for (const e of (s.truth || s.layout ? s.edges : [])) {  // labels sit off the middle, where crossing lines would stack them
+    if (!shown(e.a) || !shown(e.b)) continue;
     const text = e.mm == null ? 'no good round yet' : e.settled ? metres(e.mm) : `${metres(e.mm)}?`;
     const why = e.mm == null ? `${e.bad} rounds skipped as implausible` : `${e.agree} of the last ${e.of} rounds agree, ${e.apart_mm} mm apart`;
-    h += `<g opacity="${e.age_s > 30 ? .35 : 1}"><title>${esc(short(e.a))} to ${esc(short(e.b))}: ${why}</title>`
+    h += `<g opacity="${e.age_s > 30 ? .35 : 1}"><title>${esc(named(e.a))} to ${esc(named(e.b))}: ${why}</title>`
        + `<line x1="${X(e.a)}" y1="${Y(e.a)}" x2="${X(e.b)}" y2="${Y(e.b)}" stroke="var(--accent)" stroke-width="2"${e.settled ? '' : ' stroke-dasharray="6 5"'}/>`
        + `<text x="${X(e.a) * .62 + X(e.b) * .38}" y="${Y(e.a) * .62 + Y(e.b) * .38 + 4}" text-anchor="middle" fill="var(--text)"${e.settled ? ' font-weight="600"' : ''}>${text}</text></g>`;
   }
-  for (const n of s.nodes)
-    h += `<circle cx="${X(n.id)}" cy="${Y(n.id)}" r="8" stroke="var(--panel)" stroke-width="2" fill="${n.live ? 'var(--accent)' : 'var(--dim)'}"><title>${esc(n.id)}</title></circle>`
-       + `<text x="${X(n.id)}" y="${Y(n.id) + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(n.id))}</text>`;
+  const held = drag && drag.id && drag.moved ? drag.id : null;
+  if (hover && !held) {
+    const p = shown(hover) && pos[hover] ? pos[hover] : real.nodes[hover];
+    if (p) h += `<circle cx="${PX(p[0], p[1])}" cy="${PY(p[0], p[1])}" r="15" fill="var(--accent)" opacity=".25"/>`;
+  }
+  for (const n of s.nodes.filter(n => shown(n.id)))
+    h += `<circle cx="${X(n.id)}" cy="${Y(n.id)}" r="8" stroke="var(--panel)" stroke-width="2" fill="${n.id in colours ? hue(n.id)[1] : n.live ? 'var(--accent)' : 'var(--dim)'}" opacity="${n.id === held ? .35 : n.live || !(n.id in colours) ? 1 : .45}"${s.demo ? '' : ` data-board="${esc(n.id)}" style="cursor:pointer"`}><title>${esc(named(n.id))} board, ${esc(n.id)}${s.demo ? '' : ': click and it beeps'}</title></circle>`
+       + (n.id in colours ? '' : `<text x="${X(n.id)}" y="${Y(n.id) + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(n.id))}</text>`);
+  for (const [id, p] of Object.entries(real.nodes))
+    h += `<circle cx="${PX(p[0], p[1])}" cy="${PY(p[0], p[1])}" r="13" fill="none" stroke="var(--text)" stroke-dasharray="3 3" opacity=".75"><title>Where ${esc(short(id))} really is${shown(id) ? '' : '; its distances are being measured'}</title></circle>`
+       + (shown(id) ? '' : `<text x="${PX(p[0], p[1])}" y="${PY(p[0], p[1]) + 28}" text-anchor="middle" fill="var(--dim)">${esc(short(id))}, measuring</text>`);
+  // Live (not the demo): a sound fades out over FADE_S seconds and is gone. Its age is counted here
+  // from when this page first saw it, since the answers this page gets can be a few seconds old.
+  const heard = (s.sources || []).filter(q => shows[kind(q)] && (s.demo || age(q) < FADE_S));
+  for (const [ev, p] of Object.entries(real.sounds)) {
+    const found = heard.find(q => q.event === ev);
+    if (found && !found.far) h += `<line x1="${PX(p[0], p[1])}" y1="${PY(p[0], p[1])}" x2="${PX(found.x, found.y)}" y2="${PY(found.x, found.y)}" stroke="var(--text)" opacity=".6"/>`;
+    h += `<circle cx="${PX(p[0], p[1])}" cy="${PY(p[0], p[1])}" r="6" fill="none" stroke="var(--text)" stroke-dasharray="2 2"><title>Where the sound really was${found ? '' : ' (it could not be placed)'}</title></circle>`;
+  }
+  if (held) {  // the board being dragged: from where it is to where it would go
+    const p = shown(held) && pos[held] ? pos[held] : real.nodes[held];
+    if (p) h += `<line x1="${PX(p[0], p[1])}" y1="${PY(p[0], p[1])}" x2="${drag.sx}" y2="${drag.sy}" stroke="var(--accent)" stroke-dasharray="4 4" opacity=".7"/>`;
+    h += `<circle cx="${drag.sx}" cy="${drag.sy}" r="8" fill="var(--accent)" stroke="var(--panel)" stroke-width="2"/>`
+       + `<text x="${drag.sx}" y="${drag.sy + 24}" text-anchor="middle" font-weight="600" fill="var(--text)">${esc(short(held))}</text>`;
+  }
+  heard.forEach((q, i) => {  // oldest first, so the newest is drawn on top and strongest
+    // A buzzer placed from a ranging round (it has a note) stays fully drawn: it is a standing check of the map.
+    const newest = i === heard.length - 1;
+    const fade = !s.demo ? Math.max(0, 1 - age(q) / FADE_S) : newest || (q.note || '').startsWith('buzzer') ? 1 : Math.max(0.12, 0.5 - 0.08 * (heard.length - 2 - i));
+    const what = `${q.note ? q.note[0].toUpperCase() + q.note.slice(1) : 'Sound'} ${q.age_s.toFixed(0)} s ago: ${q.boards.map(b => `${named(b.node)} ${metres(b.distance_mm)}`).join(', ')}`;
+    h += `<g opacity="${fade}"><title>${esc(what)}</title>`;
+    if (q.far) {  // a direction and hardly a distance: a ray from the middle of the boards
+      const far = 700, bx = Math.cos(drawn(q.bearing_rad)), by = Math.sin(drawn(q.bearing_rad));
+      h += `<line x1="${PX(cx, cy)}" y1="${PY(cx, cy)}" x2="${PX(cx, cy) + far * bx}" y2="${PY(cx, cy) - far * by}" stroke="var(--sound)" stroke-width="2" stroke-dasharray="8 6"/>`;
+    } else {
+      const x = PX(q.x, q.y), y = PY(q.x, q.y), e = q.ellipse;
+      h += `<ellipse cx="${x}" cy="${y}" rx="${Math.max(3, e.major_m * k)}" ry="${Math.max(3, e.minor_m * k)}" transform="rotate(${-drawn(e.angle_rad) * 180 / Math.PI} ${x} ${y})" fill="var(--sound)" fill-opacity=".18" stroke="var(--sound)"/>`
+         + `<path d="M${x - 6} ${y}h12M${x} ${y - 6}v12" stroke="var(--sound)" stroke-width="2"/>`;
+      if (newest) {
+        for (const b of q.boards) if (pos[b.node])
+          h += `<line x1="${x}" y1="${y}" x2="${X(b.node)}" y2="${Y(b.node)}" stroke="var(--sound)" stroke-dasharray="3 4" opacity=".7"/>`;
+        if (q.alt) h += `<circle cx="${PX(q.alt.x, q.alt.y)}" cy="${PY(q.alt.x, q.alt.y)}" r="5" fill="none" stroke="var(--sound)" stroke-dasharray="2 2"><title>These arrival times fit this spot as well</title></circle>`;
+        h += `<text x="${x}" y="${y - 12}" text-anchor="middle" font-weight="600" fill="var(--sound)">${esc(said(q))}</text>`;
+      } else if (q.note) h += `<text x="${x}" y="${y - 12}" text-anchor="middle" fill="var(--sound)">${esc(said(q))}</text>`;
+    }
+    h += '</g>';
+  });
+  if (!s.truth && !s.layout)  // live, before the Anchor knows the shape: the boards wait grouped in the middle
+    h += `<text x="320" y="330" text-anchor="middle" fill="var(--dim)">${s.ranging && s.ranging.running ? 'Measuring the distances between the boards…' : 'No shape yet: press Measure again.'}</text>`;
   $('map').innerHTML = h;
 }
+
+// The buttons under the table. The table is written anew twice a second, so a 'click' (press and release
+// on the same button) is often lost between two writes: the press alone counts, on the panel that stays.
+let asking = null;  // the button whose request is on its way: it stays greyed out through the rewrites
+let note = null;    // what came of the last press, shown next to the title for a few seconds
+function tell(text) { note = { text, until: Date.now() + 6000 }; $('status').textContent = '· ' + text; }
+$('edges').addEventListener('pointerdown', async e => {
+  const b = e.target.closest && e.target.closest('button');
+  if (!b || b.disabled || asking || !last || !last.ranging) return;
+  const path = { range: 'range?rounds=6&reset=1',                 // forget distances and map, then six rounds between the boards
+                 listen: 'range?rounds=1&listen=1',               // one listening round
+                 keep: 'listen?on=' + (last.ranging.keep_listening ? 0 : 1),
+                 buzz: 'range?rounds=1&listen=1&buzz=1' }[b.id];
+  if (!path) return;
+  asking = b.id; b.disabled = true;
+  const token = location.hash.slice(1);
+  const what = { range: 'asked to measure again', listen: 'asked to listen once', keep: 'asked to switch listening', buzz: 'asked for the buzzer' }[asking];
+  try {
+    const r = await fetch(path, { method: 'POST', headers: token ? { Authorization: 'Bearer ' + token } : {} });
+    tell(r.ok ? what : r.status === 409 ? 'fewer than two listening boards heard lately' : 'the Anchor did not answer: press again');
+  } catch (err) {
+    tell('the Anchor did not answer: press again');
+  }
+  setTimeout(() => { asking = null; }, 1500);   // greyed out a moment longer, until the Anchor's state shows the change
+});
 
 function drawPanels(s, misfit) {
   let e = '<table><tr><th>Boards</th><th>Apart</th><th>Rounds that agree</th><th>Last round</th><th>Rounds</th></tr>';
   for (const d of s.edges)
-    e += `<tr class="num"><td>${esc(short(d.a))} – ${esc(short(d.b))}</td>`
+    e += `<tr class="num"><td>${chip(d.a)} – ${chip(d.b)}</td>`
        + (d.mm == null ? '<td class="dim" colspan="3">no good round yet</td>'
           : `<td>${d.settled ? `<strong>${metres(d.mm)}</strong>` : `<span class="dim">${metres(d.mm)}?</span>`}</td>`
           + `<td>${d.agree} of ${d.of}, ${d.apart_mm} mm apart</td>`
@@ -104,16 +320,181 @@ function drawPanels(s, misfit) {
        + `<td>${d.good} good, ${d.bad} skipped</td></tr>`;
   $('edges').innerHTML = (s.edges.length ? e + '</table>' : '<p class="dim">No distances yet. A distance appears when two boards finish a round and both report it.</p>')
     + (misfit == null ? '' : `<p class="num">The settled distances fit one flat layout to ${(misfit * 100).toFixed(1)} cm.</p>`)
-    + `<p class="num dim">Sound: ${s.speed.toFixed(1)} m/s at ${s.temp_c} °C. Buzzer to microphone: ${s.self_mm} mm.</p>`;
+    + `<p class="num dim">Sound: ${s.speed.toFixed(1)} m/s at ${s.temp_c} °C. Buzzer to microphone: ${s.self_mm} mm.</p>`
+    + (s.ranging && !s.demo ? `<p><button id="range" ${s.ranging.running || asking === 'range' ? 'disabled' : ''}>${asking === 'range' ? 'Asking…' : s.ranging.running ? 'Measuring…' : 'Measure again'}</button>
+        <button id="listen" ${s.ranging.running || asking === 'listen' ? 'disabled' : ''} title="The boards record two seconds without sweeping; a sound in that time is placed on the map">Listen once</button>
+        <button id="keep" ${asking === 'keep' ? 'disabled' : ''} class="${s.ranging.keep_listening ? 'on' : ''}" title="Short listening rounds one after another: a sound played at any moment shows up within seconds">${s.ranging.keep_listening ? 'Listening… (stop)' : 'Keep listening'}</button>
+        <button id="buzz" ${s.ranging.running || asking === 'buzz' ? 'disabled' : ''} title="Sounds the buzzer on the anchor's own board inside one listening round">Buzz the anchor</button>
+        <span class="dim num">Listening boards: ${s.ranging.rounds || 0} rounds started, ${s.ranging.solved || 0} gave distances.</span></p>` : '');
+  const heard = (s.sources || []).filter(q => shows[kind(q)]).reverse();
+  const real = s.truth ? s.truth.sounds : null;
+  let q = `<table><tr><th>Heard</th><th>Where</th>${real ? '<th>Off by</th>' : ''}<th>95% within</th><th>From each board</th><th>Check</th></tr>`;
+  for (const d of heard) {
+    const doubt = [d.unclear.length ? 'steady pitch: arrival times may be a cycle off' : '',
+                   d.spare ? `fit ${d.misfit.toFixed(1)} sigma` : 'no spare board to check with',
+                   d.alt ? 'a second spot fits' : ''].filter(Boolean).join('; ');
+    q += `<tr class="num"><td>${d.age_s.toFixed(0)} s ago${d.note ? `<br><span class="dim">${esc(said(d))}</span>` : ''}</td>`
+       + (d.far ? `<td>direction ${(d.bearing_rad * 180 / Math.PI).toFixed(0)}°</td>${real ? '<td></td>' : ''}<td class="dim">no distance</td>`
+                : `<td><strong>${d.x.toFixed(2)}, ${d.y.toFixed(2)} m</strong></td>`
+                  + (real ? `<td>${real[d.event] ? (Math.hypot(d.x - real[d.event][0], d.y - real[d.event][1]) * 100).toFixed(1) + ' cm' : ''}</td>` : '')
+                  + `<td>${(d.ellipse.major_m * 100).toFixed(0)} × ${(d.ellipse.minor_m * 100).toFixed(0)} cm</td>`)
+       + `<td>${d.boards.map(b => `${chip(b.node)} ${d.far ? `+${(b.later_us / 1000).toFixed(2)} ms` : metres(b.distance_mm)}`).join(', ')}</td>`
+       + `<td class="${d.unclear.length ? 'bad' : 'dim'}">${doubt}</td></tr>`;
+  }
+  const map = s.layout ? `Map of the boards: ${s.layout.from === 'live' ? 'from the distances now' : s.layout.from === 'manual' ? 'placed by hand (layout.json)' : `saved ${esc(s.layout.saved_utc || '')}`}`
+                         + (s.layout.misfit_mm == null ? '.' : `, flat to ${(s.layout.misfit_mm / 10).toFixed(1)} cm.`)
+                       : `No map of the boards yet: ${esc(s.layout_why || 'three boards with settled distances are needed')}.`;
+  $('sounds').innerHTML = (heard.length ? q + '</table>' : '<p class="dim">No sound placed yet. One appears when three or more mapped boards hear the same sound.</p>')
+    + `<p class="num dim">${map} Coordinates are metres on that map.</p>`;
 
   let b = '<table><tr><th>Board</th><th>Heard on the radio</th></tr>';
   for (const n of s.nodes)
-    b += `<tr class="num"><td>${esc(n.id)}</td><td class="${n.live ? '' : 'bad'}">${n.age_s.toFixed(0)} s ago</td></tr>`;
+    b += `<tr class="num"><td>${chip(n.id)} ${n.id in colours ? `${hue(n.id)[0]}, LED blinks ${colours[n.id] + 1}×` : esc(n.id)}</td><td class="${n.live ? '' : 'bad'}">${n.age_s == null ? 'not now; on the saved map' : `${n.age_s.toFixed(0)} s ago`}</td></tr>`;
   $('nodes').innerHTML = (s.nodes.length ? b + '</table>' : '<p class="dim">No boards heard yet. Is the dongle on the boards\' channel?</p>')
     + `<p class="num dim">${s.anchor ? `Anchor dongle ${esc(s.anchor.id)} on channel ${esc(s.anchor.channel)}.` : 'The anchor\'s dongle has not reported yet.'}</p>`;
 }
 
+// ── Demo only (locate.py demo): place sounds and boards by hand ────────────
+const map = $('map');
+const onMap = e => {  // a pointer event -> SVG units, and metres on the map
+  const r = map.getBoundingClientRect(), sx = (e.clientX - r.left) * 640 / r.width, sy = (e.clientY - r.top) * 480 / r.height;
+  return { sx, sy, x: view.cx + (sx - 320) / view.k, y: view.cy - (sy - 240) / view.k };
+};
+function boardAt(sx, sy) {  // the board whose dot or ring is under the pointer
+  let hit = null, near = 16;
+  for (const [id, ring] of Object.entries(last.truth.nodes))
+    for (const p of [ring, last.layout && last.layout.nodes[id] && pos[id]])
+      if (p) {
+        const d = Math.hypot(320 + (p[0] - view.cx) * view.k - sx, 240 - (p[1] - view.cy) * view.k - sy);
+        if (d < near) { near = d; hit = id; }
+      }
+  return hit;
+}
+const pointer = () => { map.style.cursor = drag && drag.id ? 'grabbing' : hover ? 'grab' : tool === 'board' ? 'copy' : 'crosshair'; };
+async function act(what, body) {
+  let said = '';
+  try {
+    const r = await fetch('demo/' + what, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (j.error) said = (what === 'sound' ? 'Not placed: ' : '') + j.error + '.';
+    else if (what === 'sound') said = j.far ? `The ${j.kind} is too far out to place: direction only.` : `The ${j.kind} was placed ${j.off_cm} cm from where it was.`;
+    else if (what === 'board') said = `Board ${short(j.board)} added; its distances are being measured.`;
+    else if (what === 'remove') said = `Board ${short(j.removed)} removed.`;
+    else if (what === 'move') said = `Board ${short(j.board)} moved; its distances are being measured again.`;
+    else if (what === 'reset') said = 'Back to the four boards the demo starts with.';
+  } catch (e) {
+    said = 'The demo did not answer.';
+  }
+  $('note').textContent = said;
+  tick();
+}
+let placedAt = 0;                 // when a click last added something: the second press of a double-click adds nothing
+let tap = { id: null, at: 0 };    // the last press on a board that did not move it: a second one soon after removes it
+const zoomBy = f => { zoom = Math.min(20, Math.max(0.2, zoom * f)); if (last) drawMap(last); };
+$('zin').onclick = () => zoomBy(1.4);
+$('zout').onclick = () => zoomBy(1 / 1.4);
+$('zfit').onclick = () => { zoom = 1; pan = [0, 0]; if (last) drawMap(last); };
+// Turning and mirroring the picture, live only: for matching the screen to the room as you stand in it.
+const turned = () => {
+  turn = Math.atan2(Math.sin(turn), Math.cos(turn));   // kept between -180° and 180°
+  const deg = Math.round(turn * 180 / Math.PI);
+  $('rzero').textContent = (deg === -180 ? 180 : deg) + '°';
+  $('rflip').classList.toggle('on', flip);
+  try { localStorage.setItem('mesh.turn', JSON.stringify({ turn, flip })); } catch (e) { /* private window: not remembered */ }
+  if (last) drawMap(last);
+};
+const STEP = Math.PI / 12;
+$('rleft').onclick = () => { turn += STEP; turned(); };
+$('rright').onclick = () => { turn -= STEP; turned(); };
+$('rzero').onclick = () => { turn = 0; flip = false; turned(); };
+$('rflip').onclick = () => { flip = !flip; turned(); };
+turned();
+map.addEventListener('wheel', e => {  // live: scroll to zoom
+  if (!last || last.truth) return;
+  e.preventDefault();
+  if (e.shiftKey) { turn += ((e.deltaY || e.deltaX) < 0 ? 1 : -1) * Math.PI / 36; return turned(); }   // Shift and scroll: turn by 5°
+  zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+map.addEventListener('pointermove', e => {  // live: drag the map to move it
+  if (!grab || !view) return;
+  const box = map.getBoundingClientRect(), per = 640 / box.width / view.k;   // metres per screen pixel
+  // The drag in metres as drawn, taken back through the mirror and the turn to metres on the map.
+  const vx = (flip ? -1 : 1) * (e.clientX - grab.x) * per, vy = -(e.clientY - grab.y) * per;
+  pan = [grab.pan[0] - (vx * Math.cos(turn) + vy * Math.sin(turn)), grab.pan[1] - (-vx * Math.sin(turn) + vy * Math.cos(turn))];
+  drawMap(last);
+});
+for (const end of ['pointerup', 'pointercancel', 'pointerleave']) map.addEventListener(end, () => { grab = null; });
+map.addEventListener('pointerdown', e => {  // live: a press on a board makes that board beep (POST /beep); the map is redrawn too often for 'click'
+  const board = e.target.dataset && e.target.dataset.board;
+  if (!board && last && !last.truth && !e.button) grab = { x: e.clientX, y: e.clientY, pan: pan.slice() };
+  if (!board) return;
+  const token = location.hash.slice(1);
+  fetch('beep?board=' + board, { method: 'POST', headers: token ? { Authorization: 'Bearer ' + token } : {} });
+  e.target.setAttribute('r', 13);   // a blink of the dot, until the next redraw
+  tell('beep asked');
+});
+map.addEventListener('pointerdown', e => {
+  if (!last || !last.truth || !view || e.button) return;
+  const at = onMap(e), id = boardAt(at.sx, at.sy);
+  drag = { id, sx: at.sx, sy: at.sy, x0: at.sx, y0: at.sy, moved: false };
+  map.setPointerCapture(e.pointerId);
+  pointer();
+});
+map.addEventListener('pointermove', e => {
+  if (!last || !last.truth || !view) return;
+  const at = onMap(e);
+  if (!drag) {
+    const id = boardAt(at.sx, at.sy);
+    if (id !== hover) { hover = id; pointer(); drawMap(last); }
+    return;
+  }
+  drag.sx = at.sx; drag.sy = at.sy;
+  if (Math.hypot(at.sx - drag.x0, at.sy - drag.y0) > 5) drag.moved = true;
+  if (drag.id && drag.moved) drawMap(last);
+});
+map.addEventListener('pointerup', e => {
+  if (!drag) return;
+  const d = drag, at = onMap(e), now = performance.now();
+  drag = null;
+  pointer();
+  if (d.id && d.moved) act('move', { id: d.id, x: at.x, y: at.y });
+  else if (d.id) {
+    // A double-click, told from the presses themselves: the map is redrawn under the pointer, and a browser
+    // sends no click or dblclick when the element that was pressed is gone by the time the button comes up.
+    if (tap.id === d.id && now - tap.at < 450) { tap = { id: null, at: 0 }; hover = null; act('remove', { id: d.id }); }
+    else { tap = { id: d.id, at: now }; drawMap(last); }
+  } else if (!d.moved && now - placedAt > 350) {  // not the second press of a double-click
+    placedAt = now;
+    if (tool === 'board') act('board', { x: at.x, y: at.y });
+    else act('sound', { x: at.x, y: at.y, kind: tool });
+  } else drawMap(last);
+});
+map.addEventListener('pointerleave', () => { if (hover && !drag) { hover = null; drawMap(last); } });
+map.addEventListener('pointercancel', () => { drag = null; pointer(); });
+addEventListener('keydown', e => { if (e.key === 'Escape' && drag) { drag = null; pointer(); drawMap(last); } });
+const tools = document.querySelectorAll('#demo [data-tool]');
+const pick = name => { tool = name; for (const b of tools) b.classList.toggle('on', b.dataset.tool === name); pointer(); };
+for (const b of tools) b.onclick = () => pick(b.dataset.tool);
+$('clear').onclick = () => { view = null; act('clear', {}); };
+$('reset').onclick = () => { view = null; act('reset', {}); };
+function demoBar(s) {  // how many boards there are, and no more than a ranging round takes
+  const n = Object.keys(s.truth.nodes).length, full = n >= s.max_boards;
+  $('addboard').textContent = `Board (${n} of ${s.max_boards})`;
+  $('addboard').disabled = full;
+  if (full && tool === 'board') pick('sweep');
+}
+
+let timer = null;
+const FADE_S = 10;
+const seen = {};   // a placed sound -> when this page first saw it (ms) and how old it said it was
+function age(q) {
+  const key = `${q.event}:${q.x}:${q.y}`;
+  seen[key] ||= { at: Date.now(), was: Math.min(q.age_s, FADE_S) };
+  return seen[key].was + (Date.now() - seen[key].at) / 1000;
+}
+
 async function tick() {
+  clearTimeout(timer);
   try {
     // The Anchor's token goes after '#', which the browser keeps to itself.
     const token = location.hash.slice(1);
@@ -121,15 +502,24 @@ async function tick() {
     if (r.status === 401) $('status').textContent = '· needs the Anchor\'s token: open this page as /mesh#<token>';
     else {
       const s = await r.json();
-      $('status').textContent = s.demo ? '· demo: these boards are made up' : '';
+      if (s.page_note) note = { text: s.page_note, until: Date.now() + 1000 };   // a press that came to nothing (the local page server says so)
+      $('status').textContent = s.demo ? '· demo: these boards are made up' : note && Date.now() < note.until ? '· ' + note.text : '';
+      for (const n of s.nodes) if (n.colour != null) colours[n.id] = n.colour;
+      // Boards on the saved map that the radio no longer hears (reflashed to listen) are still drawn.
+      for (const id in (s.layout ? s.layout.nodes : {}))
+        if (!s.nodes.some(n => n.id === id)) s.nodes.push({ id, age_s: null, live: false });
       const misfit = place(s);
+      last = s;
+      $('demo').hidden = $('demohelp').hidden = !s.truth;
+      if (s.truth) demoBar(s);
+      map.classList.toggle('live', !!s.truth);
       drawMap(s);
       drawPanels(s, misfit);
     }
   } catch (e) {
     $('status').textContent = '· Anchor unreachable';
   }
-  setTimeout(tick, 1000);
+  timer = setTimeout(tick, 500);
 }
 tick();
 </script>

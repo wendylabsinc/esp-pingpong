@@ -284,6 +284,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
         nack_received(info->src_addr, data, len);
         return;
     }
+    if (len >= SSR_HDR + 6 + TAG_LEN && memcmp(data, SSR_MAGIC, 4) == 0) {
+        range_received(data, len, now);
+        return;
+    }
 #endif
     /* Ranging frames carry no tag: they go to USB as they are, and the Anchor
      * treats the distances they give as unauthenticated. In ev_t: a = round,
@@ -550,6 +554,59 @@ static void send_nack(const char *args)
     }
 }
 
+/* "range <round> <slot ms> <mac,mac,...>": start a ranging round (SSR1,
+ * broadcast, signed). The frame goes out three times, each saying how long is
+ * left until the round starts, so a board that misses one copy still starts
+ * with the others. Prints "G,<round>,<slot ms>,<boards>,<start, esp_timer us>". */
+static void send_range(const char *args)
+{
+    char list[13 * SSR_MAX + 1] = {0};
+    unsigned long round = 0;
+    unsigned slot = 0;
+    if (sscanf(args, "%lu %u %104s", &round, &slot, list) != 3 || slot < 100 || slot > 1000) {
+        return;
+    }
+    uint8_t msg[SSR_HDR + 6 * SSR_MAX + TAG_LEN];
+    uint8_t n = 0;
+    for (char *tok = strtok(list, ","); tok && n < SSR_MAX; tok = strtok(NULL, ",")) {
+        if (strlen(tok) != 12) {
+            return;
+        }
+        for (int i = 0; i < 6; i++) {
+            unsigned v;
+            if (sscanf(tok + 2 * i, "%2x", &v) != 1) {
+                return;
+            }
+            msg[SSR_HDR + 6 * n + i] = (uint8_t)v;
+        }
+        n++;
+    }
+    if (!n) {
+        return;
+    }
+    uint32_t r = (uint32_t)round;
+    uint16_t s = (uint16_t)slot;
+    memcpy(msg, SSR_MAGIC, 4);
+    memcpy(msg + 4, &r, 4);
+    memcpy(msg + 8, &s, 2);
+    msg[12] = n;
+    size_t len = SSR_HDR + 6 * n;
+    int64_t start = esp_timer_get_time() + 150000;
+    for (int copy = 0; copy < 3; copy++) {
+        int64_t left = start - esp_timer_get_time();
+        if (left < 20000) {
+            break;
+        }
+        uint16_t lead = (uint16_t)(left / 1000);
+        memcpy(msg + 10, &lead, 2);
+        if (make_tag(msg, len, msg + len)) {
+            esp_now_send(BCAST, msg, len + TAG_LEN);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    emitf("G,%lu,%u,%u,%lld\n", round, slot, (unsigned)n, (long long)start);
+}
+
 static void cmd_task(void *arg)
 {
     (void)arg;
@@ -578,6 +635,9 @@ static void cmd_task(void *arg)
             esp_wifi_set_promiscuous(false);
         } else if (!strncmp(line, "nack ", 5)) {
             send_nack(line + 5);
+            continue;
+        } else if (!strncmp(line, "range ", 6)) {
+            send_range(line + 6);
             continue;
         } else if (!strcmp(line, "gpiotrig on")) {
             g_gpio_trigger = 1;

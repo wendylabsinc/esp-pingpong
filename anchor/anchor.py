@@ -24,7 +24,9 @@ from datetime import datetime, timezone
 import numpy as np
 import serial
 from clocks import Line, band
-from mesh import Mesh, PAGE as MESH_PAGE
+from mesh import Mesh, PAGE as MESH_PAGE, SPEED as SOUND_SPEED
+from locate import Locator
+import ranging
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ANCHOR_PORT", "/dev/ttyACM0")
 OUT = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUT_DIR", "fragments")
@@ -52,12 +54,101 @@ part_count = {}                  # (src, boot, frag) -> pieces expected
 part_blen = {}                   # (src, boot, frag) -> blob length
 part_seen = {}                   # (src, boot, frag) -> monotonic time of the last piece
 SALVAGE_AFTER_S = 20             # a fragment with no new piece for this long is salvaged
-NACK_AFTER_S = 1.5               # ... and is asked for its missing pieces after this long
+# ... and is asked for its missing pieces after this long. It was 1.5 s; a board sends its pieces back to
+# back (some milliseconds apart), and in the live view each wait showed up as that much more delay.
+NACK_AFTER_S = 0.5
 NACK_TRIES = 3
 nack_state = {}                  # (src, boot, frag) -> (tries, monotonic time of the last request)
 done_keys = collections.OrderedDict()  # fragments already written; late pieces are ignored
 fseq_last = [None]               # line number of the dongle's last F line
 mesh = Mesh()                    # distances between the ranging boards ("R" lines)
+locator = Locator(OUT)           # the map those distances make, and the sounds placed on it
+layout_checked = [0.0]
+# Ranging rounds between the listening boards themselves (sync-fw): distances for the same map.
+ranger = ranging.Ranger(lambda line: send_cmd(line), log=lambda m: print(m, flush=True))
+
+def mesh_view():
+    """Boards and distances from both kinds of board, as the map and the page take them."""
+    out = ranging.merge(mesh.state(), ranger.state())
+    for n in out["nodes"]:
+        n["colour"] = ranger.colour(n["id"])
+    return out
+
+ranger.on_solved = lambda: locator.update(mesh_view())
+for _board in sorted(locator.points):      # the boards of the saved map keep their colours across a restart
+    ranger.colour(_board)
+
+buzzer_heard = {}     # chirper -> its last rounds' arrival differences, {board: us after the first}
+
+def place_buzzers(rid, heard):
+    """Each buzzer of a round, placed like any sound from when the three or more microphones heard
+    it: a check of the map with a sound whose place is known, since a buzzer sits by its own board."""
+    for chirper, t in heard.items():
+        if len(t) >= 3:
+            # The middle of the last rounds: one round in ten or so times a neighbouring hump (10 to 14 cm).
+            first = min(t.values())
+            past = buzzer_heard.setdefault(chirper, collections.deque(maxlen=9))
+            past.append({b: v - first for b, v in t.items()})
+            boards = [b for b in t if all(b in p for p in past)]
+            got = locator.times(f"buzzer-{chirper}", boards, [float(np.median([p[b] for p in past])) for b in boards], SOUND_SPEED,
+                                note=f"buzzer of {chirper[-4:]}", sigma_us=[20.0] * len(boards))
+            if "x" in got:
+                at = locator.points.get(chirper)
+                print(f"round {rid}: buzzer of {chirper[-4:]} placed at x {got['x']:+.3f} y {got['y']:+.3f} m"
+                      + (f", {1000 * ((got['x'] - at[0]) ** 2 + (got['y'] - at[1]) ** 2) ** 0.5:.0f} mm from its board" if at else ""), flush=True)
+
+ranger.on_sweeps = place_buzzers
+
+def place_heard(rid, groups):
+    """Sweeps from elsewhere, heard in a listening round: placed like any sound."""
+    # A sound that repeats (a phone playing sweeps) reaches the boards with the same differences each
+    # time: those repeats are one sound, placed once from the middle of them.
+    kinds = []
+    for t in groups:
+        first = min(t.values())
+        later = {b: v - first for b, v in t.items()}
+        for kind in kinds:
+            if set(kind[0]) == set(later) and all(abs(kind[0][b] - later[b]) < 150 for b in later):
+                kind.append(later)
+                break
+        else:
+            kinds.append([later])
+    for i, kind in enumerate(kinds):
+        boards = sorted(kind[0])
+        times = [float(np.median([k[b] for k in kind])) for b in boards]
+        spread = max(max(k[b] for k in kind) - min(k[b] for k in kind) for b in boards)
+        note = "sweep heard" + (f", {len(kind)} times" if len(kind) > 1 else "")
+        got = locator.times(f"heard-{rid}-{i}", boards, times, SOUND_SPEED, note=note, sigma_us=[20.0] * len(boards))
+        print(f"round {rid}: {note} by {len(boards)} boards (arrival differences within {spread:.0f} us), "
+              + (f"placed at x {got['x']:+.3f} y {got['y']:+.3f} m" + (" (direction only)" if got["far"] else "")
+                 if "x" in got else f"not placed: {got['error']}"), flush=True)
+
+ranger.on_heard = place_heard
+
+keep_listening = {"on": False, "thread": None}
+
+def listening(on):
+    """Switch keep-listening on or off."""
+    keep_listening["on"] = on
+    if on and not (keep_listening["thread"] and keep_listening["thread"].is_alive()):
+        keep_listening["thread"] = threading.Thread(target=listen_on, daemon=True)
+        keep_listening["thread"].start()
+
+def listen_on():
+    """One short listening round after another, so a sound played at any moment shows up within seconds."""
+    while keep_listening["on"]:
+        if ranger.running:        # a measuring run has the air: two kinds of round at once spoil both (seen:
+            time.sleep(0.5)       # distances of 2 and 4 m between boards 80 cm apart)
+            continue
+        rid = ranger.start(listen=True, slots=3)          # about a second of audio per board
+        if rid is None:
+            time.sleep(3)
+            continue
+        until = time.monotonic() + 25
+        while time.monotonic() < until and keep_listening["on"] and not ranger.rounds[rid]["done"]:
+            time.sleep(0.1)
+        ranger.solve(rid)
+        time.sleep(0.1)
 
 def mac(b):
     return b.hex()
@@ -179,6 +270,7 @@ def write(meta, pcm, placed):
     return stem
 
 EVENT_GAP_US = 500_000
+round_held = collections.OrderedDict()   # ranging round -> {board: (meta, pcm)} not yet on the shared timeline
 events = []   # list of dict(t=anchor us, frags=[(meta, pcm, placed)])
 
 def add_to_event(meta, pcm, placed):
@@ -189,6 +281,8 @@ def add_to_event(meta, pcm, placed):
         events.append(ev)
         del events[:-50]
     ev["frags"] = [f for f in ev["frags"] if f[0]["node"] != meta["node"]] + [(meta, pcm, placed)]
+    # A fragment that came in before the reference board's had no line to the shared timeline: try again now.
+    ev["frags"] = [(m, p, pl if "trigger_ref_esp_us" in pl else (place(m)[0] or pl)) for m, p, pl in ev["frags"]]
     write_event(ev)
 
 def write_event(ev):
@@ -212,14 +306,29 @@ def write_event(ev):
     t0 = min(n["trigger_us"] for n in nodes)
     for n in nodes:
         n["trigger_minus_first_us"] = n["trigger_us"] - t0
-    rate = frs[0][0]["rate"]
+    # Boards may send at different rates (a round's recording goes out at half rate, and a board with
+    # older firmware still sends it whole): everything is brought down to the lowest, by a whole factor.
+    rate = min(meta["rate"] for meta, _, _ in frs)
+    audio = []
+    for meta, pc, _ in frs:
+        every = meta["rate"] // rate
+        if every > 1:   # (1 2 1) / 4 around every sample kept, as the boards do it: nothing is delayed
+            x = np.asarray(pc, np.int32)
+            x = (np.concatenate((x[:1], x[:-1])) + 2 * x + np.concatenate((x[1:], x[-1:]))) // 4
+            pc = x[::every].astype("<i2")
+        audio.append(pc)
     begin = max(starts)
-    length = min(st + len(pc) * 1e6 / rate for st, (_, pc, _) in zip(starts, frs)) - begin
+    length = min(st + len(pc) * 1e6 / rate for st, pc in zip(starts, audio)) - begin
     chans = []
-    for st, (_, pc, _) in zip(starts, frs):
+    for st, pc, n in zip(starts, audio, nodes):
         k = int(round((begin - st) * rate / 1e6))
         chans.append(pc[k:k + max(0, int(length * rate / 1e6))])
+        n["start_us"] = st + k * 1e6 / rate   # when this channel's first sample was taken: a fraction of a sample off `begin`
     m = min(len(c) for c in chans) if chans else 0
+    source = None
+    if m > 0 and use_ref and len(frs) >= 3:   # arrival-time differences need the shared-beacon timeline
+        source = locator.event(os.path.basename(stem), [n["node"] for n in nodes], [c[:m] for c in chans], rate,
+                               [n["start_us"] for n in nodes], SOUND_SPEED, [n["sigma_us"] for n in nodes])
     if m > 0:
         inter = np.stack([c[:m] for c in chans], axis=1).astype("<i2")
         with wave.open(stem + ".wav", "wb") as w:
@@ -227,10 +336,15 @@ def write_event(ev):
     with open(stem + ".json", "w") as f:
         json.dump(dict(timeline="reference node esp_timer" if use_ref else "anchor esp_timer",
                        reference_node=ref_node[0], aligned_start_us=begin, channels=[n["node"] for n in nodes],
-                       nodes=nodes), f, indent=1)
+                       nodes=nodes, source=source), f, indent=1)
     if len(frs) > 1:
         print(f"event {int(ev['t'])}: {len(frs)} nodes, " + ", ".join(
             f"{n['node'][-4:]} {n['trigger_minus_first_us']:+.1f} us (±{n['sigma_us']:.1f})" for n in nodes), flush=True)
+    if source:
+        print(f"event {int(ev['t'])}: " + (f"not placed: {source['error']}" if "error" in source else
+              f"sound at x {source['x']:+.2f} m, y {source['y']:+.2f} m" + (" (direction only)" if source["far"] else "")
+              + ", " + ", ".join(f"{b['node'][-4:]} {b['distance_mm']} mm" for b in source["boards"])
+              + f"; pairs disagree by {source['closure_us']:.0f} us"), flush=True)
 
 line_counts = collections.Counter()
 last_info = [""]
@@ -247,6 +361,22 @@ capture = {"f": None, "until": 0.0, "path": None}
 def send_cmd(line):
     with dongle_lock:
         dongle[0].write((line.strip() + "\n").encode())
+
+LATE_MS = 2000                      # a click that arrives this far behind the usual is not played any more
+stamps = collections.deque()        # (when, our clock minus the asker's stamp), the last minute's
+
+def lateness_ms(stamp_ms, now=None, wall=None):
+    """How far behind the usual a stamped request arrived, in ms. The asker stamps each request with its
+    own clock; ours minus that is the clocks' difference plus the trip. The smallest seen in the last minute
+    is a quick trip, and what a request shows over it is how long it was held up on the way (the cloud
+    tunnel holds some for many seconds and then lets several through at once)."""
+    now = time.monotonic() if now is None else now
+    gap = (time.time() if wall is None else wall) * 1000 - stamp_ms
+    with dongle_lock:
+        stamps.append((now, gap))
+        while stamps and now - stamps[0][0] > 60:
+            stamps.popleft()
+        return gap - min(g for _, g in stamps)
 
 def request_missing(now):
     """Ask nodes, through the dongle, for pieces of fragments that stopped
@@ -298,7 +428,7 @@ def reader(s):
                 elif raw:
                     capture["f"].write(f"{time.monotonic_ns()},{raw}\n")
             if raw:
-                line_counts[raw[0] if raw[0] in "TFPAEIR" else "?"] += 1
+                line_counts[raw[0] if raw[0] in "TFPAEIRG" else "?"] += 1
             if raw.startswith("I,"):
                 last_info[0] = raw
                 print(raw, flush=True)
@@ -328,6 +458,9 @@ def handle(line):
                 host_map.append(((t0 + t1) // 2, int(esp), (t1 - t0) // 2))
         elif kind == "R":
             mesh.feed(line)
+            if time.monotonic() - layout_checked[0] > 1:   # redraw the map of the boards from the distances
+                layout_checked[0] = time.monotonic()
+                locator.update(mesh_view())
         elif kind == "F":
             _, src, b64 = line.split(",", 2)
             if "," in b64:  # numbered by the dongle: F,<src>,<b64>,<n>
@@ -349,6 +482,7 @@ def handle(line):
                 if bad_tags[0] in (1, 10, 100) or bad_tags[0] % 1000 == 0:
                     print(f"dropped {bad_tags[0]} fragment pieces with bad tags", flush=True)
                 return
+            ranger.heard(src)
             frag, idx, count, blen, boot = struct.unpack_from("<IHHII", pkt, 4)
             if frag & 0xC0000000 == 0x40000000:  # Wendy Net carrier stream segment
                 if stream_relay[0]:
@@ -395,6 +529,12 @@ def node_log(src, boot, seq, data):
             f.write(f"{stamp} {boot:08x} {line}\n")
             bad = line.startswith(("W,", "L,W", "L,E", "L,\x1b[0;31mE", "L,\x1b[0;33mW"))
             print(f"node {src} {line}", file=sys.stderr if bad else sys.stdout, flush=True)
+            if line.startswith("G,"):   # a ranging round recorded: round, fragment, sweeps so far, when its own sweep began
+                try:
+                    _, rid, _frag, _count, began = line.split(",")[:5]
+                    ranger.emitted(src, int(rid), int(began))
+                except ValueError:
+                    pass
 
 def finish(key, salvage=False):
     """Assemble a fragment from its pieces. With salvage, missing pieces are
@@ -446,7 +586,24 @@ def finish(key, salvage=False):
     try:
         placed, why = place(meta)
         stem = write(meta, pcm, placed)
-        if placed:
+        if meta["bands_hit"] & ranging.RANGE_HIT:
+            # A ranging round's recording, not a sound to place, unless the boards only listened: then
+            # it is an event like any other. A recording that comes in before the reference board's has
+            # no place on the shared timeline yet (the two share no beacons in what the Anchor has
+            # seen), so every recording of the round is tried again as each one arrives.
+            rid = meta["bands_hit"] & 0x7FFFFFFF
+            held = round_held.setdefault(rid, {})
+            held[meta["node"]] = (meta, pcm)
+            while len(round_held) > 8:
+                round_held.popitem(last=False)
+            for node, (m2, p2) in list(held.items()):
+                again = placed if m2 is meta else place(m2)[0]
+                if again and "trigger_ref_esp_us" in again:
+                    del held[node]
+                    ranger.fragment(m2, p2, again)
+                    if ranger.listening(rid):
+                        add_to_event(m2, p2, again)
+        elif placed:
             add_to_event(meta, pcm, placed)
     except Exception as e:
         print(f"fragment {src} #{frag}: place/write error {e!r}", flush=True)
@@ -587,10 +744,18 @@ def serve_files():
         """With header "Authorization: Bearer <token>":
         GET  /...                         fragments, events, captures
         GET  /stats                       line counts, incomplete fragments, USB health
-        GET  /mesh.json                   ranging boards and the distances between them
+        GET  /mesh.json                   ranging boards, the distances between them, the map
+                                          they make and the sounds placed on it (locate.py)
         GET  /mesh                        the page that draws them; needs no token
                                           itself, open it as /mesh#<token>
         POST /cmd?line=<dongle command>   allowlisted, e.g. line=gpio%206
+        POST /listen?on=<1|0>             keep listening: sounds placed as they come
+        POST /beep?board=<mac>            that board plays its sweep three times
+                                          &t=<asker's clock, ms> on any POST: dropped when it arrives over 2 s
+                                          (a beep) or 6 s (the rest) behind the usual trip
+        POST /range?rounds=<n>            ranging rounds between the listening boards;
+                                          &reset=1: forget distances and map first, measure from nothing
+                                          &listen=1: they only record, and sweeps from elsewhere are placed
         POST /capture?seconds=<n>         raw dongle lines -> captures/<t>.csv"""
         def _authorized(self):
             got = self.headers.get("Authorization", "")
@@ -619,8 +784,16 @@ def serve_files():
                     "incomplete": inc, "dongle_info": last_info[0],
                     "usb_read_bytes": getattr(usb, "read_bytes", None), "usb_backlog": usb.backlog() if hasattr(usb, "backlog") else None,
                 }, indent=1) + "\n")
+            if path == "/mesh.json" and "t" in parse_qs(urlparse(self.path).query):
+                try:
+                    lateness_ms(float(parse_qs(urlparse(self.path).query)["t"][0]))  # keeps the quick-trip figure fresh
+                except ValueError:
+                    pass
             if path == "/mesh.json":
-                return self._text(json.dumps(mesh.state()), "application/json")
+                state = mesh_view()
+                state["ranging"]["keep_listening"] = keep_listening["on"]
+                locator.update(state)
+                return self._text(json.dumps(dict(state, **locator.view())), "application/json")
             if self.path == "/gpiochips":
                 import gpioline
                 return self._text(json.dumps(gpioline.chips(), indent=1) + "\n")
@@ -635,12 +808,53 @@ def serve_files():
             if not self._authorized():
                 return
             u = urlparse(self.path); q = parse_qs(u.query)
+            if "t" in q:   # &t=<asker's clock, ms>: a press held up on the way is dropped, not acted on late
+                try:
+                    late = lateness_ms(float(q["t"][0]))
+                except ValueError:
+                    return self.send_error(400, "bad t")
+                if late > (LATE_MS if u.path == "/beep" else 3 * LATE_MS):
+                    return self.send_error(408, f"{late:.0f} ms late, dropped")
             if u.path == "/cmd" and "line" in q:
                 line = q["line"][0].strip()
                 if not allowed.fullmatch(line):
                     return self.send_error(400, "command not allowed")
                 send_cmd(line)
                 return self._text(f"sent: {line}\n")
+            if u.path == "/beep":     # one board plays its sweep three times: which one is this?
+                board = q.get("board", [""])[0].lower()
+                if not re.fullmatch(r"[0-9a-f]{12}", board):
+                    return self.send_error(400, "bad board")
+                ranger.beep(board)
+                return self._text(f"beep {board}\n")
+            if u.path == "/listen":   # keep listening: short listening rounds one after another, until switched off
+                listening(q.get("on", ["1"])[0] == "1")
+                return self._text("listening on\n" if keep_listening["on"] else "listening off\n")
+            if u.path == "/range":   # ranging rounds between the listening boards (ranging.py)
+                try:
+                    rounds = min(max(int(q.get("rounds", ["5"])[0]), 1), 50)
+                except ValueError:
+                    return self.send_error(400, "bad rounds")
+                boards = ranger.live()
+                if "order" in q:   # slot order by hand, e.g. to see whether a fault follows the board or the slot
+                    boards = [m for m in q["order"][0].lower().split(",") if re.fullmatch(r"[0-9a-f]{12}", m)][:ranging.MAX_BOARDS]
+                if len(boards) < 2:
+                    return self.send_error(409, f"{len(boards)} boards heard lately, 2 needed")
+                was_listening = keep_listening["on"]
+                keep_listening["on"] = False      # one thing at a time on the air; taken up again afterwards
+                listen = q.get("listen", ["0"])[0] == "1"
+                if q.get("reset", ["0"])[0] == "1" and not listen and not ranger.running:
+                    # Measure again from nothing: distances, the map and the sounds on it all go, and
+                    # the boards are placed anew from the rounds that follow.
+                    ranger.reset()
+                    with mesh.lock:
+                        mesh.edges.clear()
+                    buzzer_heard.clear()
+                    locator.reset()
+                started = ranger.run(rounds, order=boards, listen=listen, after=(lambda: listening(True)) if was_listening else None)
+                if started and listen and q.get("buzz", ["0"])[0] == "1":   # this board's own buzzer, inside the round
+                    threading.Timer(0.9, lambda: dchirp(prn_seed=int(time.time()) % 60000 + 300)).start()
+                return self._text((f"{rounds} rounds with " if started else "already ranging ") + ", ".join(boards) + "\n")
             if u.path == "/buzz":
                 # Toggling an arbitrary GPIO line can disturb the board (one
                 # expander line on the Dragonwing is not free); off by default.
@@ -731,6 +945,13 @@ def main():
     for c in ("beacon on", "rate 10", "ap off"):
         send_cmd(c); time.sleep(0.05)
     threading.Thread(target=reader, args=(s,), daemon=True).start()
+    every = float(os.environ.get("RANGE_EVERY_S", 0))   # 0: only when asked (POST /range)
+    if every > 0:
+        def keep_ranging():
+            while True:
+                time.sleep(every)
+                ranger.run(1)
+        threading.Thread(target=keep_ranging, daemon=True).start()
     print(f"anchor on {PORT}, writing to {OUT}", flush=True)
     i = 0
     while True:

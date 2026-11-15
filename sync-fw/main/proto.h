@@ -15,6 +15,12 @@
  *   boot id, u32 frag_id, u16 n, n x u16 piece index, tag. A node answers only
  *   for its current boot id, from fragments it still holds.
  *
+ * SSR1 ranging round (Anchor -> every node, broadcast by the dongle): "SSR1",
+ *   u32 round, u16 slot_ms, u16 lead_ms, u8 n, n x u8 mac[6], tag. The round
+ *   starts lead_ms after this frame; board i of the list plays its sweep
+ *   i * slot_ms into it. Every board that hears the frame records the round
+ *   as one fragment whose bands_hit is RANGE_HIT | round.
+ *
  * Fragment blob = meta, then PCM (int16 mono at meta.rate):
  *   "SSM1", u8 node_mac[6], u16 n_bands, u32 frag_id, u32 rate,
  *   i64 first_n, u32 n_samples, i64 trigger_n, u32 bands_hit,
@@ -37,6 +43,17 @@
 #define SSN_MAGIC "SSN1"
 #define SSN_HDR 14
 #define SSN_MAX 64
+#define SSR_MAGIC "SSR1"
+#define SSR_HDR 13
+#define SSR_MAX 8
+#define RANGE_HIT 0x80000000u /* in bands_hit: a ranging round's recording, round id in the low 31 bits */
+/* The same round through a dongle that only knows "nack": an SSN1 frame per
+ * board whose boot id is this, frag_id the round, and the values slot_ms,
+ * lead_ms, n, then each board's address as three u16. */
+#define RANGE_BOOT 0x31474e52u /* "RNG1" */
+/* "Beep": an SSN1 frame whose boot id is this; the first value is how many sweeps to play (1 to 5).
+ * For telling the boards apart by ear: the Anchor's page sends it to the board that is clicked. */
+#define BEEP_BOOT 0x31504542u /* "BEP1" */
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -88,3 +105,4 @@ extern uint32_t g_boot_id;
 void audio_start(void);
 int audio_command(const char *line); /* returns 1 if handled */
 void nack_received(const uint8_t *src, const uint8_t *data, int len); /* Wi-Fi task */
+void range_received(const uint8_t *data, int len, int64_t now_us);     /* Wi-Fi task */
