@@ -558,7 +558,7 @@ async function tick() {
     else {
       const s = await r.json();
       if (s.page_note) note = { text: s.page_note, until: Date.now() + 1000 };   // a press that came to nothing (the local page server says so)
-      $('status').textContent = s.demo ? '· demo: these boards are made up' : note && Date.now() < note.until ? '· ' + note.text : '';
+      $('status').textContent = s.demo ? '· demo: these boards are made up' : s.page_age_s > 4 ? `· no answer from the Anchor for ${s.page_age_s.toFixed(0)} s (the cloud tunnel has stalled): what you see is that old` : note && Date.now() < note.until ? '· ' + note.text : '';
       for (const n of s.nodes) if (n.colour != null) colours[n.id] = n.colour;
       // Boards on the saved map that the radio no longer hears (reflashed to listen) are still drawn.
       for (const id in (s.layout ? s.layout.nodes : {}))
