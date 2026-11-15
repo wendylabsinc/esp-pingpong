@@ -542,6 +542,8 @@ def node_log(src, boot, seq, data):
                 except ValueError:
                     pass
 
+reports_off = {}   # board -> when it was last told to stop its sweep reports
+
 def finish(key, salvage=False):
     """Assemble a fragment from its pieces. With salvage, missing pieces are
     zero-filled: a fragment whose header pieces (meta, block stamps, beacons)
@@ -590,6 +592,15 @@ def finish(key, salvage=False):
     else:
         completed[src] += 1
     try:
+        if ranging.is_report(meta["bands_hit"]):
+            # The boards carry the firmware of branch locate-gapfree, which reports sweeps itself unless told
+            # not to, and is told so again by this after a board restarts. This Anchor has no use for the
+            # reports: it places sweeps from listening rounds.
+            if time.monotonic() - reports_off.get(src, -1e9) > 5:
+                reports_off[src] = time.monotonic()
+                send_cmd(f"nack {src} {ranging.DETECT_BOOT:08x} 0 0")
+                print(f"fragment {src} #{frag}: a sweep report; told the board to stop sending them", flush=True)
+            return
         placed, why = place(meta)
         stem = write(meta, pcm, placed)
         if meta["bands_hit"] & ranging.RANGE_HIT:

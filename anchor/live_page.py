@@ -12,7 +12,13 @@ token = hmac.new(bytes.fromhex(open(sys.argv[3]).read().strip()), b"anchor-http"
 state = {"json": b'{"nodes": [], "edges": [], "anchor": null, "speed": 343.4, "temp_c": 20, "self_mm": 40}', "page": None, "at": 0.0, "sent": 0.0}
 lock = threading.Lock()
 
-def ask(path, method="GET", timeout=25):
+# No request to the Anchor is given up on early. Measured 2026-11-15: the cloud relay stops passing anything
+# for most of a minute now and then, and requests abandoned meanwhile (each shows in the tunnel's log as
+# "context canceled") went together with the next stall. A press that comes through late is dropped by the
+# Anchor itself (it carries this clock), so waiting costs nothing.
+PATIENCE_S = 75
+
+def ask(path, method="GET", timeout=PATIENCE_S):
     req = urllib.request.Request(upstream + path, method=method, headers={"Authorization": "Bearer " + token})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read()
@@ -26,29 +32,46 @@ def poll(wait):
         try:
             _, body = ask(f"/mesh.json?t={sent * 1000:.0f}")   # stamped: the Anchor learns what a quick trip looks like
             json.loads(body)
+            if time.time() - sent > 8:
+                print(f"{time.strftime('%H:%M:%S')} an answer took {time.time() - sent:.0f} s", flush=True)
             with lock:
                 if sent > state["sent"]:          # an answer to an older question never replaces a newer one
                     state["json"], state["sent"], state["at"] = body, sent, time.time()
         except Exception as e:
-            print("upstream:", e, flush=True)
+            print(time.strftime("%H:%M:%S"), "upstream:", e, f"after {time.time() - sent:.0f} s", flush=True)
             time.sleep(2)
         time.sleep(0.1)
 
+# At most this many presses are on their way at once. Each may wait PATIENCE_S, so without a limit a held-down
+# button, or anything else posting here, would pile up threads for as long as the relay stays quiet.
+presses = threading.BoundedSemaphore(4)
+
+def own_page(headers):
+    """Is this request from the page this server hands out? Its buttons change things (boards beep, the map is
+    measured anew), so a page from elsewhere open in the same browser must not be able to press them: the
+    Host must be this server by name (which also stops a foreign name pointed at 127.0.0.1), and a browser's
+    Origin, when it sends one, must be this server too."""
+    mine = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
+    origin = headers.get("Origin")
+    return headers.get("Host", "") in mine and (origin is None or origin in {"http://" + m for m in mine})
+
 def press(path, full):
-    """Pass one press of a button on to the Anchor. Each is stamped with this clock, so the Anchor can drop
-    one that was held up on the way instead of acting late. A beep is given up on after 4 s. The other
-    buttons are asked again, up to three times 6 s: a second copy does no harm (a run already going is left
-    alone). What went wrong, if anything, is shown on the page for a few seconds."""
+    """Pass one press of a button on to the Anchor, once. It is stamped with this clock, so the Anchor drops
+    it if it was held up on the way instead of acting late. What went wrong, if anything, is shown on the
+    page for a few seconds."""
     why = "the Anchor did not answer: press again"
-    for _ in range(1 if path == "/beep" else 3):
+    sent = time.time()
+    try:
         try:
-            ask(f"{full}{'&' if '?' in full else '?'}t={time.time() * 1000:.0f}", "POST", timeout=4 if path == "/beep" else 6)
-            return
-        except urllib.error.HTTPError as e:
-            why = {409: "fewer than two listening boards heard lately", 408: "held up on the way and dropped: press again"}.get(e.code, f"the Anchor said {e.code}")
-            break
-        except Exception:
-            pass
+            ask(f"{full}{'&' if '?' in full else '?'}t={sent * 1000:.0f}", "POST")
+        finally:
+            presses.release()
+        return
+    except urllib.error.HTTPError as e:
+        why = {409: "fewer than two listening boards heard lately",
+               408: f"held up {time.time() - sent:.0f} s on the way and dropped: press again"}.get(e.code, f"the Anchor said {e.code}")
+    except Exception:
+        pass
     print("press", full, "->", why, flush=True)
     with lock:
         state["note"], state["note_at"] = why, time.time()
@@ -68,18 +91,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/mesh.json":
             with lock:
                 body, note = state["json"], state.get("note") if time.time() - state.get("note_at", 0) < 6 else None
+                old = time.time() - state["at"] if state["at"] else None
             if note:      # a press that came to nothing, told to the page with the next few copies
                 body = body.rstrip()[:-1] + b', "page_note": ' + json.dumps(note).encode() + b"}"
+            if old is not None:   # how old this copy is: the page says so when the relay has gone quiet
+                body = body.rstrip()[:-1] + b', "page_age_s": ' + f"{old:.1f}".encode() + b"}"
             return self.send(200, body, "application/json")
         self.send(404, b"not here\n")
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/range", "/listen", "/dchirp", "/beep"):
+        if path not in ("/range", "/listen", "/dchirp", "/beep", "/detect"):
             return self.send(404, b"not here\n")
         # The page gets its answer at once and the press goes on to the Anchor behind its back: the tunnel
         # holds about one request in twelve for many seconds, and a browser keeps only six requests open
         # to one address, so a few held presses used to stop the page's own refreshing (greyed buttons,
         # a dot that stayed large, presses that seemed to do nothing).
+        if not own_page(self.headers):
+            return self.send(403, b"not from this page\n")
+        if not presses.acquire(blocking=False):
+            with lock:
+                state["note"], state["note_at"] = "four presses are still on their way: wait for them", time.time()
+            return self.send(429, b"too many presses on their way\n")
         threading.Thread(target=press, args=(path, self.path), daemon=True).start()
         self.send(202, b"asked\n")
     def log_message(self, *a):

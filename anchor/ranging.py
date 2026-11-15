@@ -33,6 +33,13 @@ from mesh import AGREE_MIN, KEEP, SELF_M, SPEED, agree
 RANGE_HIT = 0x80000000              # sync-fw proto.h
 RANGE_BOOT = 0x31474E52             # sync-fw proto.h: a round carried by the dongle's "nack" command
 BEEP_BOOT = 0x31504542              # sync-fw proto.h: "play your sweep this many times"
+HEARD_HIT = 0x40000000      # in bands_hit: a sweep report from the newer firmware on the boards, not audio
+DETECT_BOOT = 0x31544544    # "DET1": switches those reports on or off
+
+
+def is_report(bands_hit):
+    """A sweep report from the newer firmware, not a round's recording whose number has the same bit set."""
+    return bands_hit & (RANGE_HIT | HEARD_HIT) == HEARD_HIT
 LEAD_MS = 250                       # from the first board being told to the start of the round
 SLOT_MS = 160                       # one sweep (64 ms), its echoes, and the next board's turn
 PRE_MS = 60                         # sync-fw RANGE_PRE_MS: recorded before slot 0
@@ -391,7 +398,9 @@ class Ranger:
         if listen:
             slot_ms = LISTEN_SLOT_MS
         with self.lock:
-            rid = self.last_round = max(int(time.time()) & 0x7FFFFFFF, self.last_round + 1)
+            # Round numbers stay under HEARD_HIT: the firmware now on the boards (branch locate-gapfree) takes
+            # a recording whose number has that bit set for one of its sweep reports and sends no audio.
+            rid = self.last_round = max(int(time.time()) & (HEARD_HIT - 1), self.last_round + 1) & (HEARD_HIT - 1)
             self.rounds[rid] = dict(order=order, slot_ms=slot_ms, at=time.monotonic(), recs={}, done=False, listen=listen)
             while len(self.rounds) > 16:
                 self.rounds.popitem(last=False)

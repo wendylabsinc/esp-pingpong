@@ -328,6 +328,16 @@ above the room noise at the boards:
   `/mesh.json` it keeps fresh, for when the Anchor is reached through
   `wendy cloud tunnel` (a second or two per request).
 
+### Rolled back on 2026-11-15, and what the boards carry
+
+This branch was taken back to the version before the boards reported sweeps themselves. That work is on
+branch `locate-gapfree` (firmware `sweepdet.c`, the Anchor's handling, a test). The three boards still
+carry its firmware, which cannot be changed without USB, so this Anchor does two things for them: it
+switches a board's reports off when one arrives (`DETECT_BOOT`; a board switches them on again when it
+restarts), and it keeps round numbers under bit 30, which that firmware takes for a report. The firmware
+source here is the older one and is not what runs on the boards. `live_page.py` is the newer one (it
+refuses presses from other pages and says how old its data is).
+
 ### Boards in shells (2026-11-15)
 
 With each board in a closed shell its own sweep is about fifty times louder at its own microphone
