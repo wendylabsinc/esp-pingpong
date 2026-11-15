@@ -7,8 +7,9 @@ the same sound into events. See the docstring in `anchor.py`.
 ```bash
 # once: shared key for nodes, dongle and Anchor (writes secret.key here)
 ../sync-fw/genkey.sh
-# on a laptop
-python anchor.py /dev/cu.usbmodem101 fragments
+# on a laptop: the dongle's port, where recordings go; HTTP_PORT switches the map and its buttons on
+HTTP_PORT=8091 python anchor.py /dev/cu.usbmodem101 fragments
+python live_page.py 8093 http://127.0.0.1:8091 secret.key mesh.html   # then http://localhost:8093/mesh
 # on a WendyOS device, dongle on ttyACM0
 SOUNDSYNC_KEY=$(cat secret.key) wendy run --device <device>
 ```
@@ -354,6 +355,19 @@ detector for a laptop and feeds it made-up audio: arrival differences between bo
 - The three boards run the build made before a one-line fix in `build_blob` (a round whose number has
   bit 30 set was taken for a report). The Anchor keeps round numbers under that bit, so it does not
   matter until someone starts rounds from elsewhere; the fix is in the source for the next build.
+
+### The laptop is the Anchor (2026-11-15)
+
+The dongle moved from the Dragonwing to the laptop and `anchor.py` runs there. The reason is the route
+to the Dragonwing, not the Dragonwing: the office Wi-Fi does not let two of its clients talk to each
+other, which left `wendy cloud tunnel`, and that stopped passing anything for up to a minute at a time
+(measured: during a stall the Anchor answered on the device itself in under 16 ms and the device reached
+the internet in under 250 ms). On the laptop the page's data is 0.1 s old and a press is acted on at
+once. The Dragonwing's buzzer ("Buzz the anchor") is not there on a laptop. To go back, a cable straight
+from the Dragonwing's Ethernet port to the laptop avoids both the Wi-Fi's rule and the cloud.
+
+For an hour in between, branch `locate` was taken back to the version before the boards' own sweep
+reports (commits bd35a0e and e318c0a there); with the tunnel gone, this branch is in use again.
 
 ### Boards in shells (2026-11-15)
 
