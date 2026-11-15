@@ -42,6 +42,19 @@ def poll(wait):
             time.sleep(2)
         time.sleep(0.1)
 
+# At most this many presses are on their way at once. Each may wait PATIENCE_S, so without a limit a held-down
+# button, or anything else posting here, would pile up threads for as long as the relay stays quiet.
+presses = threading.BoundedSemaphore(4)
+
+def own_page(headers):
+    """Is this request from the page this server hands out? Its buttons change things (boards beep, the map is
+    measured anew), so a page from elsewhere open in the same browser must not be able to press them: the
+    Host must be this server by name (which also stops a foreign name pointed at 127.0.0.1), and a browser's
+    Origin, when it sends one, must be this server too."""
+    mine = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
+    origin = headers.get("Origin")
+    return headers.get("Host", "") in mine and (origin is None or origin in {"http://" + m for m in mine})
+
 def press(path, full):
     """Pass one press of a button on to the Anchor, once. It is stamped with this clock, so the Anchor drops
     it if it was held up on the way instead of acting late. What went wrong, if anything, is shown on the
@@ -49,7 +62,10 @@ def press(path, full):
     why = "the Anchor did not answer: press again"
     sent = time.time()
     try:
-        ask(f"{full}{'&' if '?' in full else '?'}t={sent * 1000:.0f}", "POST")
+        try:
+            ask(f"{full}{'&' if '?' in full else '?'}t={sent * 1000:.0f}", "POST")
+        finally:
+            presses.release()
         return
     except urllib.error.HTTPError as e:
         why = {409: "fewer than two listening boards heard lately",
@@ -90,6 +106,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # holds about one request in twelve for many seconds, and a browser keeps only six requests open
         # to one address, so a few held presses used to stop the page's own refreshing (greyed buttons,
         # a dot that stayed large, presses that seemed to do nothing).
+        if not own_page(self.headers):
+            return self.send(403, b"not from this page\n")
+        if not presses.acquire(blocking=False):
+            with lock:
+                state["note"], state["note_at"] = "four presses are still on their way: wait for them", time.time()
+            return self.send(429, b"too many presses on their way\n")
         threading.Thread(target=press, args=(path, self.path), daemon=True).start()
         self.send(202, b"asked\n")
     def log_message(self, *a):
