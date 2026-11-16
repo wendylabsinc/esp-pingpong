@@ -1,7 +1,7 @@
 set(srcs "main.c")
 set(reqs esp_wifi esp_timer esp_event esp_driver_usb_serial_jtag esp_driver_gpio nvs_flash mbedtls esp_hw_support)
 if(IDF_TARGET STREQUAL "esp32s3")
-    list(APPEND srcs "audio.c")
+    list(APPEND srcs "audio.c" "sweepdet.c")
     list(APPEND reqs esp_driver_i2s esp_psram esp_driver_gpio esp_rom)
 endif()
 idf_component_register(SRCS ${srcs} INCLUDE_DIRS "." PRIV_REQUIRES ${reqs})
