@@ -1,10 +1,64 @@
-# Handoff: sound sync and Wendy Net over ESP-NOW (state on 2026-11-14)
+# Handoff: sound sync and Wendy Net over ESP-NOW (state on 2026-11-14, updated 2026-11-16)
 
 What works, what is left, and the traps that cost time. Details and numbers
-are in `README.md` (sound sync, three nodes) and `wendy-lite-espnow/README.md`
-(Wendy Net over ESP-NOW).
+are in `README.md` (sound sync, three nodes), `anchor/README.md` (sound
+location) and `wendy-lite-espnow/README.md` (Wendy Net over ESP-NOW).
 
-## Where things run
+## Branches reconciled on `main` (2026-11-16)
+
+`main` is the version to start from. It is the code that last ran on the
+hardware (2026-11-15), and every other branch is either in it or listed here
+with the reason it is not.
+
+| Branch | On `main`? | Note |
+| --- | --- | --- |
+| `soundsync`, `audio-timing`, `three-node-delivery`, `range-standalone` | yes | merged earlier, pull requests 1 to 5 |
+| `locate-gapfree` | yes | sound location, the boards' own sweep reports, the laptop as Anchor, the path of sweeps |
+| `locate` | recorded as merged, nothing taken | the rollback to before the sweep reports; its two own commits only make that older Anchor cope with boards on the newer firmware |
+| `sender-bound-tags` | no | see below |
+
+**Why `sender-bound-tags` is not on `main`.** It changes what every frame's tag
+covers, so nodes, dongle and Anchor only understand each other when all of
+them carry it, and it has never run on hardware. It also no longer fits: it was
+written when `sync-fw` signed or checked a tag in three places, and a trial
+merge conflicts in `sync-fw/main/audio.c`. To bring it in, port it rather than
+merge it:
+
+- `make_tag` and `tag_ok` in `sync-fw/main/main.c` take the sender's address;
+  there are now ten callers (four in `main.c`, six in `audio.c`). A node
+  checking a `nack` or a ranging schedule has to check it against the address
+  it came from, which `range_received` is not handed today.
+- Both Wendy Lite components (`wendy-lite-espnow/wendy_espnow` and
+  `wendy-lite-espnow/leaf/wendy_espnow`) have their own copies of the two
+  functions.
+- On the Anchor: `tag_ok` in `anchor/anchor.py`, and the made-up boards in
+  `anchor/sim_boards.py`, which sign the same way.
+- Then flash the three boards and the dongle in one go and run a ranging round
+  before trusting it.
+
+**Hardware as last seen (2026-11-15).** The table under "Where things run" is
+the state of 2026-11-14 and no longer holds.
+
+- The three XIAOs (`4824`, `4e58`, `4ff8`) were flashed over USB with the
+  `sync-fw` that became commit `9628d0b`, in a build made before that commit's
+  one-line fix in `build_blob` (see `anchor/README.md`, "The three boards run
+  the build made before a one-line fix"). None of them runs the Wendy Lite
+  firmware now.
+- The dongle was on a laptop's USB and the Anchor ran on that laptop
+  (`anchor/README.md`, "The laptop is the Anchor"). The Dragonwing was taken
+  out of the setup.
+- Board `4824` stopped being heard at about 15:30 that day and did not come
+  back after being powered again. It was not on USB, so its console was not
+  read and the cause is not known.
+
+**Checked for this merge, on a laptop only:** `anchor/path_test.js`,
+`anchor/test_sweepdet.py`, `anchor/sim_boards.py`,
+`wendy-lite-espnow/wendy_espnow/test/test_ens.py`, `box/test_taploc.py`,
+`range/test_agree.c`, `range/test_peers.c` and `firmware/test_chirp.c` all
+pass, and `sync-fw` builds for the ESP32-S3 and the ESP32-C5 (ESP-IDF 6.0.3).
+Nothing was run on boards on 2026-11-16: no board or dongle was connected.
+
+## Where things run (2026-11-14)
 
 | Piece | Firmware or code | State |
 | --- | --- | --- |
@@ -59,10 +113,11 @@ holds the component sources and the patches to apply. Local copies: worktree
 8. **Absolute time, base station to node, is unreliable** (1.5 to 2 ms off in
    the three-node runs). Node-to-node timing does not depend on it.
 9. **Open branches elsewhere:** `sender-bound-tags` here (the tag also covers
-   the sender address; needs nodes and dongle reflashed together), and a local
-   WendyOS fix for the gpio entitlement (`fix/gpio-entitlement-all-chips`).
+   the sender address; needs nodes and dongle reflashed together; what a port
+   takes is listed under "Branches reconciled on `main`"), and a local WendyOS
+   fix for the gpio entitlement (`fix/gpio-entitlement-all-chips`).
 
-## Sound location (branch `locate`, run on three boards 2026-11-14)
+## Sound location (first run on three boards 2026-11-14; later state in `anchor/README.md`)
 
 See `anchor/README.md`, "Where a sound came from" and "Distances between the
 listening boards". State at the end of the evening:
